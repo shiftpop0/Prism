@@ -1,0 +1,3044 @@
+package main
+
+import (
+	"bytes"
+	"cmp"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+type apiResponse struct {
+	Code    string      `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data"`
+	TraceID string      `json:"trace_id"`
+}
+
+type server struct {
+	db         *sql.DB
+	externalDB *sql.DB
+}
+
+type appConfig struct {
+	Backend struct {
+		ServerAddr string `json:"server_addr"`
+	} `json:"backend"`
+	DBTableWhitelist struct {
+		Sdata []string `json:"sdata"`
+		Wxzdb []string `json:"wxzdb"`
+	} `json:"db_table_whitelist"`
+	MySQL struct {
+		DSN string `json:"dsn"`
+	} `json:"mysql"`
+	ExternalMySQL struct {
+		Database string `json:"database"`
+		DSN      string `json:"dsn"`
+	} `json:"external_mysql"`
+	LLM struct {
+		APIBase   string `json:"api_base"`
+		ModelName string `json:"model_name"`
+		APIKey    string `json:"api_key"`
+	} `json:"llm"`
+	Dialogue struct {
+		SystemPromptTemplate string   `json:"system_prompt_template"`
+		QuickPrompts         []string `json:"quick_prompts"`
+	} `json:"dialogue"`
+}
+
+var runtimeConfig appConfig
+var runtimeConfigPath string
+
+type summaryRow struct {
+	ID         string
+	Type       string
+	Msisdn1    string
+	Msisdn2    string
+	Cnt        int
+	CntDt      int
+	Summary    string
+	Score      float64
+	Qklx       sql.NullString
+	Label2     sql.NullString
+	UserID     sql.NullString
+	UserName   sql.NullString
+	Status     string
+	UpdateTime string
+	DataDate   string
+}
+
+type clueFilters struct {
+	Keyword      string
+	Status       string
+	MarkTag      string
+	Distribute   string
+	ScoreMin     *float64
+	ScoreMax     *float64
+	DataDateFrom string
+	DataDateTo   string
+	SortBy       string
+	SortOrder    string
+}
+
+type workflowState struct {
+	ID         string
+	Status     string
+	Level      sql.NullString
+	Remark     sql.NullString
+	MarkTag    sql.NullString
+	Distribute sql.NullString
+}
+
+type messageRow struct {
+	ID          string
+	CaptureTime string
+	Msisdn      string
+	CallType    string
+	Message     string
+}
+
+type feedbackHistoryRow struct {
+	ID               string
+	Feedback         string
+	FeedbackTime     string
+	FeedbackUserID   sql.NullString
+	FeedbackUserName sql.NullString
+	Remark           sql.NullString
+}
+
+func main() {
+	log.SetOutput(os.Stdout)
+	runtimeConfig = loadAppConfig()
+	if runtimeConfigPath != "" {
+		log.Printf("config loaded from: %s", runtimeConfigPath)
+	} else {
+		log.Printf("config loaded from: (not found, using zero-value defaults)")
+	}
+
+	srv := &server{}
+	if err := srv.initMySQL(); err != nil {
+		log.Fatalf("mysql init failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1", srv.apiIndex)
+	mux.HandleFunc("/api/v1/health", srv.health)
+	mux.HandleFunc("/api/v1/dashboard/overview", srv.dashboardOverview)
+	mux.HandleFunc("/api/v1/dashboard/trend", srv.dashboardTrend)
+	mux.HandleFunc("/api/v1/dashboard/type-distribution", srv.dashboardTypeDistribution)
+	mux.HandleFunc("/api/v1/clues", srv.clues)
+	mux.HandleFunc("/api/v1/clues/filter-options", srv.cluesFilterOptions)
+	mux.HandleFunc("/api/v1/clues/", srv.cluesSubRoutes)
+	mux.HandleFunc("/api/v1/dialogue/agent-spec", srv.dialogueAgentSpec)
+	mux.HandleFunc("/api/v1/dialogue/snapshot", srv.dialogueSnapshot)
+	mux.HandleFunc("/api/v1/dialogue/sessions/", srv.dialogueMessage)
+	mux.HandleFunc("/api/v1/reports/generate", srv.reportGenerate)
+	mux.HandleFunc("/api/v1/db/tables", srv.dbTables)
+	mux.HandleFunc("/api/v1/db/tables/", srv.dbTableRows)
+	mux.HandleFunc("/api/v1/db/import-feedback-to-history", srv.importFeedbackToHistory)
+	mux.HandleFunc("/api/v1/db/import-distribute-to-workflow", srv.importDistributeToWorkflow)
+	mux.HandleFunc("/api/v1/db/init-workflow-state", srv.initWorkflowState)
+	registerFrontendRoutes(mux)
+
+	addr := envOrDefault("SERVER_ADDR", ":8080")
+	log.Printf("Prism API listening on %s", addr)
+	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (s *server) dialogueAgentSpec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	scriptPath := filepath.Join("scripts", "read_case_snapshot.go")
+	scriptContent, err := os.ReadFile(scriptPath)
+	if err != nil {
+		scriptContent = []byte("# script read failed")
+	}
+
+	description := strings.Join([]string{
+		"# Agent Data Skill",
+		"你是研判助手Agent，允许通过受限数据源进行分析。",
+		"",
+		"## 允许的数据源",
+		"- 数据表: nb_tab_grjd_summary",
+		"- 工作流表: nb_tab_grjd_workflow_state",
+		"",
+		"## 允许读取字段（白名单）",
+		"- type",
+		"- level",
+		"- score",
+		"- summary",
+		"",
+		"## 单案件固定命令（仅供审计）",
+		"go run ./scripts/read_case_snapshot.go --clue-id <案件ID>",
+		"",
+		"## 范围分析模式",
+		"- scope=all: 对全量线索做聚合分析",
+		"- scope=day: 对指定日期(YYYY-MM-DD)线索做聚合分析",
+		"- scope=single: 对单案件做明细分析（默认）",
+		"",
+		"## 约束",
+		"- 不允许读取白名单之外字段",
+		"- 不允许执行删除、更新、写入类命令",
+		"- 输出结论必须引用上述字段",
+	}, "\n")
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"title":         "研判助手数据源说明",
+			"description":   description,
+			"command":       "go run ./scripts/read_case_snapshot.go --clue-id <案件ID> (single)",
+			"script_path":   scriptPath,
+			"script":        string(scriptContent),
+			"quick_prompts": getDialogueQuickPrompts(),
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) apiIndex(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"service": "prism-backend",
+			"version": "v1",
+			"endpoints": []string{
+				"/api/v1/health",
+				"/api/v1/dashboard/overview",
+				"/api/v1/dashboard/trend",
+				"/api/v1/dashboard/type-distribution",
+				"/api/v1/clues",
+			},
+		},
+		TraceID: traceID(),
+	})
+}
+
+func canonicalPair(msisdn1, msisdn2 string) (string, string) {
+	if lessOrEqualNumericString(msisdn1, msisdn2) {
+		return msisdn1, msisdn2
+	}
+	return msisdn2, msisdn1
+}
+
+func (s *server) initMySQL() error {
+	if err := s.validateExternalDBConfig(); err != nil {
+		return err
+	}
+
+	dsn := strings.TrimSpace(runtimeConfig.MySQL.DSN)
+	if dsn == "" {
+		return errors.New("mysql.dsn is required in prism-config.json")
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return err
+	}
+
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		return err
+	}
+
+	log.Println("mysql connected")
+	s.db = db
+
+	externalDSN := strings.TrimSpace(runtimeConfig.ExternalMySQL.DSN)
+	if strings.TrimSpace(externalDSN) != "" {
+		externalDB, err := sql.Open("mysql", externalDSN)
+		if err == nil {
+			externalDB.SetMaxOpenConns(20)
+			externalDB.SetMaxIdleConns(5)
+			externalDB.SetConnMaxLifetime(30 * time.Minute)
+			if pingErr := externalDB.Ping(); pingErr == nil {
+				s.externalDB = externalDB
+				log.Println("external mysql connected")
+			} else {
+				log.Printf("external mysql ping failed, fallback to sdata db: %v", pingErr)
+			}
+		} else {
+			log.Printf("external mysql open failed, fallback to sdata db: %v", err)
+		}
+	}
+
+	if err := s.ensureMessageAndSummaryTables(); err != nil {
+		return err
+	}
+	if err := s.ensureWorkflowTable(); err != nil {
+		return err
+	}
+	if err := s.ensureDistributeTable(); err != nil {
+		return err
+	}
+	if err := s.ensureFeedbackHistoryTable(); err != nil {
+		return err
+	}
+	if err := s.ensureFeedbackMappingTable(); err != nil {
+		return err
+	}
+	if err := s.ensureZaFeedbackBitNormalized(); err != nil {
+		return err
+	}
+	if err := s.syncFeedbackStatusFromHistory(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *server) bizDB() *sql.DB {
+	if s.externalDB != nil {
+		return s.externalDB
+	}
+	return s.db
+}
+
+func (s *server) bizSchemaName() string {
+	if s.externalDB != nil {
+		return ""
+	}
+	schema := strings.TrimSpace(runtimeConfig.ExternalMySQL.Database)
+	if schema == "" {
+		schema = "wxzdb"
+	}
+	return schema
+}
+
+func (s *server) bizTable(name string) string {
+	schema := s.bizSchemaName()
+	if schema == "" {
+		return "`" + name + "`"
+	}
+	return "`" + schema + "`.`" + name + "`"
+}
+
+func (s *server) allowedTablesSet(dbKey string) map[string]bool {
+	var raw []string
+	switch dbKey {
+	case "sdata":
+		raw = runtimeConfig.DBTableWhitelist.Sdata
+	case "wxzdb":
+		raw = runtimeConfig.DBTableWhitelist.Wxzdb
+	default:
+		return map[string]bool{}
+	}
+	set := make(map[string]bool, len(raw))
+	for _, name := range raw {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		set[trimmed] = true
+	}
+	return set
+}
+
+func (s *server) isTableAllowed(dbKey, tableName string) bool {
+	allowed := s.allowedTablesSet(dbKey)
+	if len(allowed) == 0 {
+		return true
+	}
+	return allowed[tableName]
+}
+
+func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"service": "prism-backend",
+			"time":    time.Now().Format(time.RFC3339),
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) dashboardOverview(w http.ResponseWriter, r *http.Request) {
+	summaries, workflow, err := s.loadCanonicalSummariesWithState("")
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	highRisk := 0
+	processing := 0
+	closed := 0
+	for _, item := range summaries {
+		if item.Score >= 0.9 {
+			highRisk++
+		}
+		st := workflow[item.ID]
+		if st.Status == "核查中" {
+			processing++
+		}
+		if st.Status == "已处置" {
+			closed++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"kpi": map[string]interface{}{
+				"high_risk_count":     highRisk,
+				"new_clue_count":      len(summaries),
+				"processing_count":    processing,
+				"closed_count":        closed,
+				"false_positive_rate": 0.0,
+			},
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) dashboardTrend(w http.ResponseWriter, r *http.Request) {
+	summaries, _, err := s.loadCanonicalSummariesWithState("")
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	type group struct {
+		Total    int
+		HighRisk int
+	}
+	groups := map[string]group{}
+	for _, item := range summaries {
+		key := ""
+		if len(item.ID) >= 8 {
+			parts := strings.Split(item.ID, "-")
+			if len(parts) == 3 {
+				dt := parts[2]
+				key = dt[0:4] + "-" + dt[4:6] + "-" + dt[6:8]
+			}
+		}
+		if key == "" {
+			key = time.Now().Format("2006-01-02")
+		}
+		val := groups[key]
+		val.Total++
+		if item.Score >= 0.9 {
+			val.HighRisk++
+		}
+		groups[key] = val
+	}
+
+	dates := make([]string, 0, len(groups))
+	for date := range groups {
+		dates = append(dates, date)
+	}
+	slices.Sort(dates)
+
+	points := make([]map[string]interface{}, 0, len(dates))
+	for _, date := range dates {
+		points = append(points, map[string]interface{}{
+			"date":      date,
+			"total":     groups[date].Total,
+			"high_risk": groups[date].HighRisk,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data:    points,
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) dashboardTypeDistribution(w http.ResponseWriter, r *http.Request) {
+	summaries, _, err := s.loadCanonicalSummariesWithState("")
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	groups := map[string]int{}
+	for _, item := range summaries {
+		groups[item.Type]++
+	}
+	result := make([]map[string]interface{}, 0, len(groups))
+	for key, val := range groups {
+		result = append(result, map[string]interface{}{"type": key, "value": val})
+	}
+	slices.SortFunc(result, func(a, b map[string]interface{}) int {
+		return cmp.Compare(a["type"].(string), b["type"].(string))
+	})
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: "0", Message: "OK", Data: result, TraceID: traceID()})
+}
+
+func (s *server) clues(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	filters := clueFilters{
+		Keyword:      strings.TrimSpace(r.URL.Query().Get("keyword")),
+		Status:       strings.TrimSpace(r.URL.Query().Get("status")),
+		MarkTag:      strings.TrimSpace(r.URL.Query().Get("mark_tag")),
+		Distribute:   strings.TrimSpace(r.URL.Query().Get("distribute")),
+		DataDateFrom: strings.TrimSpace(r.URL.Query().Get("data_date_from")),
+		DataDateTo:   strings.TrimSpace(r.URL.Query().Get("data_date_to")),
+		SortBy:       strings.TrimSpace(r.URL.Query().Get("sort_by")),
+		SortOrder:    strings.TrimSpace(r.URL.Query().Get("sort_order")),
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("score_min")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil {
+			filters.ScoreMin = &v
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("score_max")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil {
+			filters.ScoreMax = &v
+		}
+	}
+	page := 1
+	pageSize := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			pageSize = parsed
+		}
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+
+	summaries, total, err := s.loadSummariesPage(filters, page, pageSize)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	ids := make([]string, 0, len(summaries))
+	for _, item := range summaries {
+		ids = append(ids, item.ID)
+	}
+	if err := s.ensureWorkflowRows(ids); err != nil {
+		internalError(w, err)
+		return
+	}
+	workflow, err := s.loadWorkflowMapByIDs(ids)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	latestFeedback, err := s.loadLatestFeedbackMap(ids)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	list := make([]map[string]interface{}, 0, len(summaries))
+	for _, item := range summaries {
+		st := workflow[item.ID]
+		fb := latestFeedback[item.ID]
+		list = append(list, map[string]interface{}{
+			"id":                item.ID,
+			"type":              item.Type,
+			"qklx":              item.Qklx.String,
+			"summary":           item.Summary,
+			"msisdn_1":          item.Msisdn1,
+			"msisdn_2":          item.Msisdn2,
+			"score":             item.Score,
+			"update_time":       item.UpdateTime,
+			"data_date":         item.DataDate,
+			"status":            resolveStatus(st.Status, fb.Feedback != ""),
+			"level":             st.Level.String,
+			"feedback":          fb.Feedback,
+			"feedback_time":     fb.FeedbackTime,
+			"feedback_username": fb.FeedbackUserName.String,
+			"remark":            st.Remark.String,
+			"mark_tag":          st.MarkTag.String,
+			"distribute":        st.Distribute.String,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"total":     total,
+			"page":      page,
+			"page_size": pageSize,
+			"list":      list,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) cluesFilterOptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	statuses := make([]string, 0, 16)
+	statusRows, err := s.bizDB().Query(
+		`SELECT DISTINCT status FROM ` + s.bizTable("nb_tab_grjd_workflow_state") + ` WHERE status IS NOT NULL AND TRIM(status) <> '' ORDER BY status`,
+	)
+	if err == nil {
+		defer statusRows.Close()
+		for statusRows.Next() {
+			var v sql.NullString
+			if scanErr := statusRows.Scan(&v); scanErr == nil {
+				val := strings.TrimSpace(v.String)
+				if val != "" {
+					statuses = append(statuses, val)
+				}
+			}
+		}
+	}
+
+	distributes := make([]string, 0, 64)
+	distributeRows, err := s.bizDB().Query(
+		`SELECT DISTINCT distribute FROM ` + s.bizTable("nb_tab_grjd_workflow_state") + ` WHERE distribute IS NOT NULL AND TRIM(distribute) <> '' ORDER BY distribute`,
+	)
+	if err == nil {
+		defer distributeRows.Close()
+		for distributeRows.Next() {
+			var v sql.NullString
+			if scanErr := distributeRows.Scan(&v); scanErr == nil {
+				val := strings.TrimSpace(v.String)
+				if val != "" {
+					distributes = append(distributes, val)
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"status_options":     statuses,
+			"distribute_options": distributes,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) cluesSubRoutes(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/detail") && r.Method == http.MethodGet:
+		s.clueDetail(w, r)
+	case strings.HasSuffix(r.URL.Path, "/feedbacks") && r.Method == http.MethodGet:
+		s.clueFeedbacks(w, r)
+	case strings.HasSuffix(r.URL.Path, "/messages") && r.Method == http.MethodGet:
+		s.clueMessages(w, r)
+	case strings.HasSuffix(r.URL.Path, "/action") && r.Method == http.MethodPost:
+		s.clueAction(w, r)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *server) clueDetail(w http.ResponseWriter, r *http.Request) {
+	clueID := pathSegment(r.URL.Path, 3)
+	if clueID == "" {
+		badRequest(w, "invalid clue id")
+		return
+	}
+
+	target, err := s.loadSummaryByID(clueID)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if target == nil {
+		notFound(w, "clue not found")
+		return
+	}
+	if err := s.ensureWorkflowRows([]string{target.ID}); err != nil {
+		internalError(w, err)
+		return
+	}
+	workflow, err := s.loadWorkflowMapByIDs([]string{target.ID})
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	st := workflow[target.ID]
+	latestFeedback, err := s.loadLatestFeedbackMap([]string{clueID})
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	fb := latestFeedback[target.ID]
+
+	data := map[string]interface{}{
+		"id":                target.ID,
+		"type":              target.Type,
+		"msisdn_1":          target.Msisdn1,
+		"msisdn_2":          target.Msisdn2,
+		"cnt":               target.Cnt,
+		"cnt_dt":            target.CntDt,
+		"summary":           target.Summary,
+		"score":             target.Score,
+		"qklx":              target.Qklx.String,
+		"label2":            target.Label2.String,
+		"user_id":           target.UserID.String,
+		"user_name":         target.UserName.String,
+		"status":            resolveStatus(st.Status, fb.Feedback != ""),
+		"level":             st.Level.String,
+		"feedback":          fb.Feedback,
+		"feedback_time":     fb.FeedbackTime,
+		"feedback_username": fb.FeedbackUserName.String,
+		"remark":            st.Remark.String,
+		"mark_tag":          st.MarkTag.String,
+		"distribute":        st.Distribute.String,
+		"update_time":       target.UpdateTime,
+		"data_date":         target.DataDate,
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: "0", Message: "OK", Data: data, TraceID: traceID()})
+}
+
+func (s *server) clueFeedbacks(w http.ResponseWriter, r *http.Request) {
+	clueID := pathSegment(r.URL.Path, 3)
+	if clueID == "" {
+		badRequest(w, "invalid clue id")
+		return
+	}
+
+	canonical := canonicalID(clueID)
+	reversed := reverseID(canonical)
+	rows, err := s.bizDB().Query(`
+		SELECT clue_id, feedback_content, DATE_FORMAT(feedback_time, '%Y-%m-%d %H:%i:%s'), feedback_userId, feedback_username, remark
+		FROM `+s.bizTable("nb_tab_grjd_feedback_history")+`
+		WHERE clue_id IN (?, ?)
+		ORDER BY feedback_time ASC`, canonical, reversed)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	list := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var item feedbackHistoryRow
+		if err := rows.Scan(&item.ID, &item.Feedback, &item.FeedbackTime, &item.FeedbackUserID, &item.FeedbackUserName, &item.Remark); err != nil {
+			internalError(w, err)
+			return
+		}
+		item.ID = canonical
+		list = append(list, map[string]interface{}{
+			"id":                item.ID,
+			"feedback":          item.Feedback,
+			"feedback_time":     item.FeedbackTime,
+			"feedback_userId":   item.FeedbackUserID.String,
+			"feedback_username": item.FeedbackUserName.String,
+			"remark":            item.Remark.String,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: "0", Message: "OK", Data: list, TraceID: traceID()})
+}
+
+func (s *server) clueMessages(w http.ResponseWriter, r *http.Request) {
+	clueID := pathSegment(r.URL.Path, 3)
+	if clueID == "" {
+		badRequest(w, "invalid clue id")
+		return
+	}
+
+	canonical := canonicalID(clueID)
+	reversed := reverseID(canonical)
+
+	rows, err := s.db.Query(
+		`SELECT id, capture_time, msisdn, calltype, message
+         FROM nb_tab_grjd_message
+         WHERE id IN (?, ?)
+         ORDER BY capture_time ASC`,
+		canonical, reversed,
+	)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	byMessage := map[string]messageRow{}
+	for rows.Next() {
+		var item messageRow
+		if err := rows.Scan(&item.ID, &item.CaptureTime, &item.Msisdn, &item.CallType, &item.Message); err != nil {
+			internalError(w, err)
+			return
+		}
+
+		prev, exists := byMessage[item.Message]
+		if !exists {
+			byMessage[item.Message] = item
+			continue
+		}
+
+		if prev.CallType == "2" && item.CallType == "1" {
+			byMessage[item.Message] = item
+			continue
+		}
+
+		if prev.CallType == item.CallType && item.CaptureTime < prev.CaptureTime {
+			byMessage[item.Message] = item
+		}
+	}
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
+	}
+
+	list := make([]messageRow, 0, len(byMessage))
+	for _, item := range byMessage {
+		list = append(list, item)
+	}
+	slices.SortFunc(list, func(a, b messageRow) int {
+		return cmp.Compare(a.CaptureTime, b.CaptureTime)
+	})
+
+	resp := make([]map[string]interface{}, 0, len(list))
+	for _, item := range list {
+		resp = append(resp, map[string]interface{}{
+			"sender":       item.Msisdn,
+			"capture_time": item.CaptureTime,
+			"message":      item.Message,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Code: "0", Message: "OK", Data: resp, TraceID: traceID()})
+}
+
+func (s *server) clueAction(w http.ResponseWriter, r *http.Request) {
+	clueID := pathSegment(r.URL.Path, 3)
+	if clueID == "" {
+		badRequest(w, "invalid clue id")
+		return
+	}
+
+	var req struct {
+		Action string `json:"action"`
+		Value  string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		badRequest(w, "invalid body")
+		return
+	}
+	if req.Action == "" {
+		badRequest(w, "action required")
+		return
+	}
+
+	canonical := canonicalID(clueID)
+	if err := s.upsertWorkflowAction(canonical, req.Action, req.Value); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"id": canonical,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) dialogueMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages") {
+		methodNotAllowed(w)
+		return
+	}
+
+	var req struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+		FocusID string `json:"focus_id"`
+		Scope   string `json:"scope"`
+		Date    string `json:"date"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		badRequest(w, "invalid body")
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		badRequest(w, "content required")
+		return
+	}
+
+	di := dialogueInput{FocusID: req.FocusID, Scope: req.Scope, Date: req.Date}
+	scope, err := validateDialogueInput(di)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+
+	snapshot, citationTitle, citationSource, err := s.buildDialogueSnapshot(scope, req.FocusID, req.Date)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	systemPrompt := buildDialogueSystemPrompt(scope, req.Date, snapshot)
+
+	answer, err := s.callDeepseekDialogue(req.Content, systemPrompt)
+	if err != nil {
+		log.Printf("dialogue llm call failed: %v", err)
+		answer = s.friendlyDialogueError(err)
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"answer": answer,
+			"citations": []map[string]string{
+				{
+					"evidence_id": "evd_7788",
+					"title":       citationTitle,
+					"source":      citationSource,
+				},
+			},
+			"safety_flags": []string{},
+		},
+		TraceID: traceID(),
+	})
+}
+
+type dialogueInput struct {
+	FocusID string
+	Scope   string
+	Date    string
+}
+
+func validateDialogueInput(di dialogueInput) (string, error) {
+	scope := normalizeScope(di.Scope)
+	if scope == "single" && strings.TrimSpace(di.FocusID) == "" {
+		return "", errors.New("focus_id required for single scope")
+	}
+	if scope == "day" && strings.TrimSpace(di.Date) == "" {
+		return "", errors.New("date required for day scope (YYYY-MM-DD)")
+	}
+	return scope, nil
+}
+
+func buildDialogueSystemPrompt(scope, day, snapshot string) string {
+	tpl := strings.TrimSpace(runtimeConfig.Dialogue.SystemPromptTemplate)
+	if tpl == "" {
+		tpl = "你是研判助手Agent。你只能使用快照中的字段(type,level,score,summary)及聚合指标输出结论，不得臆造。\n分析范围: {{scope}}\n指定日期: {{day}}\n分析快照(JSON): {{snapshot}}"
+	}
+
+	dayValue := strings.TrimSpace(day)
+	if dayValue == "" {
+		dayValue = "-"
+	}
+	scopeValue := strings.TrimSpace(scope)
+	if scopeValue == "" {
+		scopeValue = "single"
+	}
+	snapshotValue := strings.TrimSpace(snapshot)
+	if snapshotValue == "" {
+		snapshotValue = "{}"
+	}
+
+	systemPrompt := strings.ReplaceAll(tpl, "{{scope}}", scopeValue)
+	systemPrompt = strings.ReplaceAll(systemPrompt, "{{day}}", dayValue)
+	systemPrompt = strings.ReplaceAll(systemPrompt, "{{snapshot}}", snapshotValue)
+	return systemPrompt
+}
+
+func (s *server) dialogueSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	di := dialogueInput{
+		FocusID: strings.TrimSpace(r.URL.Query().Get("focus_id")),
+		Scope:   strings.TrimSpace(r.URL.Query().Get("scope")),
+		Date:    strings.TrimSpace(r.URL.Query().Get("date")),
+	}
+	scope, err := validateDialogueInput(di)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+
+	snapshot, title, source, err := s.buildDialogueSnapshot(scope, di.FocusID, di.Date)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	systemPrompt := buildDialogueSystemPrompt(scope, di.Date, snapshot)
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"scope":         scope,
+			"focus_id":      di.FocusID,
+			"date":          di.Date,
+			"title":         title,
+			"source":        source,
+			"snapshot":      snapshot,
+			"system_prompt": systemPrompt,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func normalizeScope(scope string) string {
+	val := strings.ToLower(strings.TrimSpace(scope))
+	switch val {
+	case "all", "day", "single":
+		return val
+	default:
+		return "single"
+	}
+}
+
+func dateToIDSuffix(day string) (string, error) {
+	trimmed := strings.TrimSpace(day)
+	if trimmed == "" {
+		return "", errors.New("empty date")
+	}
+	t, err := time.Parse("2006-01-02", trimmed)
+	if err != nil {
+		return "", errors.New("invalid date format, expected YYYY-MM-DD")
+	}
+	return t.Format("20060102"), nil
+}
+
+func trimSummary(text string) string {
+	r := []rune(strings.TrimSpace(text))
+	if len(r) <= 80 {
+		return string(r)
+	}
+	return string(r[:80]) + "..."
+}
+
+func (s *server) buildDialogueSnapshot(scope, focusID, day string) (string, string, string, error) {
+	if scope == "single" {
+		cmdOut, err := s.buildSingleDialogueSnapshot(focusID)
+		if err != nil {
+			return "", "", "", err
+		}
+		return cmdOut, "案件快照（受限字段）", "read_case_snapshot.go", nil
+	}
+
+	rows, workflow, err := s.loadCanonicalSummariesWithState("")
+	if err != nil {
+		return "", "", "", err
+	}
+
+	filtered := make([]summaryRow, 0, len(rows))
+	title := "全量线索聚合快照"
+	if scope == "day" {
+		suffix, err := dateToIDSuffix(day)
+		if err != nil {
+			return "", "", "", err
+		}
+		title = "指定日期线索聚合快照(" + day + ")"
+		for _, item := range rows {
+			_, _, dt, ok := splitID(item.ID)
+			if ok && dt == suffix {
+				filtered = append(filtered, item)
+			}
+		}
+	} else {
+		filtered = rows
+	}
+
+	if len(filtered) == 0 {
+		emptyData := map[string]interface{}{
+			"scope": scope,
+			"date":  day,
+			"total": 0,
+			"note":  "no clue data in current scope",
+		}
+		buf, _ := json.Marshal(emptyData)
+		return string(buf), title, "in-process-aggregator", nil
+	}
+
+	typeCounter := map[string]int{}
+	levelCounter := map[string]int{}
+	scoreSum := 0.0
+	highRiskCount := 0
+	top := filtered[0]
+	for _, item := range filtered {
+		typeCounter[item.Type]++
+		level := strings.TrimSpace(workflow[item.ID].Level.String)
+		if level == "" {
+			level = "未标注"
+		}
+		levelCounter[level]++
+		scoreSum += item.Score
+		if item.Score >= 0.9 {
+			highRiskCount++
+		}
+		if item.Score > top.Score {
+			top = item
+		}
+	}
+
+	sampled := make([]map[string]interface{}, 0, 10)
+	sorted := make([]summaryRow, len(filtered))
+	copy(sorted, filtered)
+	slices.SortFunc(sorted, func(a, b summaryRow) int {
+		if a.Score == b.Score {
+			return cmp.Compare(a.ID, b.ID)
+		}
+		if a.Score > b.Score {
+			return -1
+		}
+		return 1
+	})
+	for i := 0; i < len(sorted) && i < 10; i++ {
+		item := sorted[i]
+		sampled = append(sampled, map[string]interface{}{
+			"type":    item.Type,
+			"level":   workflow[item.ID].Level.String,
+			"score":   item.Score,
+			"summary": trimSummary(item.Summary),
+		})
+	}
+
+	snapshotData := map[string]interface{}{
+		"scope":              scope,
+		"date":               day,
+		"total":              len(filtered),
+		"high_risk_count":    highRiskCount,
+		"avg_score":          scoreSum / float64(len(filtered)),
+		"type_distribution":  typeCounter,
+		"level_distribution": levelCounter,
+		"top_risk_case": map[string]interface{}{
+			"type":    top.Type,
+			"level":   workflow[top.ID].Level.String,
+			"score":   top.Score,
+			"summary": trimSummary(top.Summary),
+		},
+		"samples_top_score": sampled,
+	}
+
+	buf, _ := json.Marshal(snapshotData)
+	return string(buf), title, "in-process-aggregator", nil
+}
+
+func (s *server) buildSingleDialogueSnapshot(clueID string) (string, error) {
+	canonical := canonicalID(strings.TrimSpace(clueID))
+	if canonical == "" {
+		return "", errors.New("focus_id required for single scope")
+	}
+	reversed := reverseID(canonical)
+
+	var item struct {
+		Type    string
+		Score   float64
+		Summary string
+	}
+	if err := s.db.QueryRow(
+		`SELECT type, score, summary FROM nb_tab_grjd_summary WHERE id IN (?, ?) ORDER BY update_time DESC LIMIT 1`,
+		canonical, reversed,
+	).Scan(&item.Type, &item.Score, &item.Summary); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errors.New("clue not found")
+		}
+		return "", err
+	}
+
+	var level sql.NullString
+	_ = s.bizDB().QueryRow(
+		`SELECT level FROM `+s.bizTable("nb_tab_grjd_workflow_state")+` WHERE id IN (?, ?) LIMIT 1`,
+		canonical, reversed,
+	).Scan(&level)
+
+	out := map[string]interface{}{
+		"type":    item.Type,
+		"level":   level.String,
+		"score":   item.Score,
+		"summary": trimSummary(item.Summary),
+	}
+	buf, _ := json.Marshal(out)
+	return string(buf), nil
+}
+
+func (s *server) callDeepseekDialogue(userContent, systemPrompt string) (string, error) {
+	apiBase := envOrDefault("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
+	model := envOrDefault("DEEPSEEK_MODEL_NAME", "deepseek-chat")
+	apiKey := strings.TrimSpace(envOrDefault("DEEPSEEK_API_KEY", ""))
+	if apiKey == "" {
+		return "", errors.New("missing DEEPSEEK_API_KEY")
+	}
+
+	payload := map[string]interface{}{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userContent},
+		},
+		"temperature": 0.2,
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(apiBase, "/")+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 25 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("llm status: %d body: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return "", err
+	}
+	if len(decoded.Choices) == 0 {
+		return "", errors.New("empty llm choices")
+	}
+	return strings.TrimSpace(decoded.Choices[0].Message.Content), nil
+}
+
+func (s *server) friendlyDialogueError(err error) string {
+	errText := err.Error()
+	base := "外部模型调用失败，已返回本地兜底结论：建议提升核查优先级并追加回访。"
+
+	switch {
+	case strings.Contains(errText, "missing DEEPSEEK_API_KEY"):
+		return base + " 原因：未配置 API Key，请检查 config/prism-config.json 的 llm.api_key 或环境变量 DEEPSEEK_API_KEY。"
+	case strings.Contains(errText, "llm status: 401"):
+		return base + " 原因：API Key 无效或已过期（401）。请更新 llm.api_key。"
+	case strings.Contains(errText, "llm status: 403"):
+		return base + " 原因：当前账号无该模型权限（403）。请检查模型权限或更换 model_name。"
+	case strings.Contains(errText, "llm status: 429"):
+		return base + " 原因：请求过频或额度不足（429）。请稍后重试并检查配额。"
+	case strings.Contains(errText, "Client.Timeout"):
+		return base + " 原因：调用超时。请检查网络连通性或稍后重试。"
+	default:
+		return base + " 原因：" + errText
+	}
+}
+
+func (s *server) reportGenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"report_id":    "rpt_20260414_001",
+			"status":       "ready",
+			"download_url": "",
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) dbTables(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	dbKey := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("db")))
+	if dbKey == "" {
+		dbKey = "sdata"
+	}
+
+	var db *sql.DB
+	schema := ""
+	switch dbKey {
+	case "sdata":
+		db = s.db
+		schema = ""
+	case "wxzdb":
+		if s.externalDB != nil {
+			db = s.externalDB
+			schema = ""
+		} else {
+			db = s.db
+			schema = strings.TrimSpace(runtimeConfig.ExternalMySQL.Database)
+			if schema == "" {
+				schema = "wxzdb"
+			}
+		}
+	default:
+		badRequest(w, "db must be sdata or wxzdb")
+		return
+	}
+
+	query := "SHOW TABLES"
+	if schema != "" {
+		query = fmt.Sprintf("SHOW TABLES FROM `%s`", schema)
+	}
+
+	rows, err := db.Query(query)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	tables := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			internalError(w, err)
+			return
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
+	}
+	allowed := s.allowedTablesSet(dbKey)
+	if len(allowed) > 0 {
+		filtered := make([]string, 0, len(tables))
+		for _, name := range tables {
+			if allowed[name] {
+				filtered = append(filtered, name)
+			}
+		}
+		tables = filtered
+	}
+	slices.Sort(tables)
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"db":     dbKey,
+			"tables": tables,
+		},
+		TraceID: traceID(),
+	})
+}
+
+var mysqlTableNamePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+func (s *server) dbTableRows(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	dbKey := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("db")))
+	if dbKey == "" {
+		dbKey = "sdata"
+	}
+
+	var db *sql.DB
+	schema := ""
+	switch dbKey {
+	case "sdata":
+		db = s.db
+		schema = ""
+	case "wxzdb":
+		if s.externalDB != nil {
+			db = s.externalDB
+			schema = ""
+		} else {
+			db = s.db
+			schema = strings.TrimSpace(runtimeConfig.ExternalMySQL.Database)
+			if schema == "" {
+				schema = "wxzdb"
+			}
+		}
+	default:
+		badRequest(w, "db must be sdata or wxzdb")
+		return
+	}
+
+	tableName := strings.TrimSpace(pathSegment(r.URL.Path, 4))
+	if tableName == "" || !mysqlTableNamePattern.MatchString(tableName) {
+		badRequest(w, "invalid table name")
+		return
+	}
+	if !s.isTableAllowed(dbKey, tableName) {
+		notFound(w, "table not allowed")
+		return
+	}
+
+	filterField := strings.TrimSpace(r.URL.Query().Get("filter_field"))
+	filterValue := strings.TrimSpace(r.URL.Query().Get("filter_value"))
+	if filterField != "" && !mysqlTableNamePattern.MatchString(filterField) {
+		badRequest(w, "invalid filter field")
+		return
+	}
+
+	page := 1
+	pageSize := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%d", &page); err != nil || page < 1 {
+			page = 1
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%d", &pageSize); err != nil || pageSize < 1 {
+			pageSize = 20
+		}
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+	offset := (page - 1) * pageSize
+
+	tableExpr := fmt.Sprintf("`%s`", tableName)
+	if schema != "" {
+		tableExpr = fmt.Sprintf("`%s`.`%s`", schema, tableName)
+	}
+
+	whereClause := ""
+	countArgs := make([]interface{}, 0)
+	if filterField != "" && filterValue != "" {
+		whereClause = fmt.Sprintf(" WHERE `%s` LIKE ?", filterField)
+		countArgs = append(countArgs, "%"+filterValue+"%")
+	}
+
+	countQuery := fmt.Sprintf("SELECT COUNT(1) FROM %s%s", tableExpr, whereClause)
+	var total int
+	if err := db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+		internalError(w, err)
+		return
+	}
+
+	query := fmt.Sprintf("SELECT * FROM %s%s LIMIT ? OFFSET ?", tableExpr, whereClause)
+	rowArgs := make([]interface{}, 0, len(countArgs)+2)
+	rowArgs = append(rowArgs, countArgs...)
+	rowArgs = append(rowArgs, pageSize, offset)
+	rows, err := db.Query(query, rowArgs...)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	columnTypes, _ := rows.ColumnTypes()
+
+	list := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		scans := make([]interface{}, len(columns))
+		for i := range values {
+			scans[i] = &values[i]
+		}
+		if err := rows.Scan(scans...); err != nil {
+			internalError(w, err)
+			return
+		}
+
+		item := map[string]interface{}{}
+		for i, col := range columns {
+			val := values[i]
+			switch v := val.(type) {
+			case []byte:
+				typeName := ""
+				if i < len(columnTypes) {
+					typeName = strings.ToUpper(columnTypes[i].DatabaseTypeName())
+				}
+				if typeName == "BIT" && len(v) > 0 {
+					acc := 0
+					for _, b := range v {
+						acc = (acc << 8) | int(b)
+					}
+					item[col] = acc
+				} else {
+					item[col] = string(v)
+				}
+			default:
+				item[col] = v
+			}
+		}
+		list = append(list, item)
+	}
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
+	}
+
+	primaryKeys, err := s.getPrimaryKeyColumns(db, schema, tableName)
+	if err != nil {
+		primaryKeys = []string{}
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"db":           dbKey,
+			"table":        tableName,
+			"columns":      columns,
+			"primary_keys": primaryKeys,
+			"rows":         list,
+			"page":         page,
+			"page_size":    pageSize,
+			"total":        total,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) getPrimaryKeyColumns(db *sql.DB, schema, tableName string) ([]string, error) {
+	targetSchema := schema
+	if targetSchema == "" {
+		if err := db.QueryRow("SELECT DATABASE()").Scan(&targetSchema); err != nil {
+			return nil, err
+		}
+	}
+
+	rows, err := db.Query(`
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION`, targetSchema, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	list := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		list = append(list, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func normalizeDateToCompact(raw string) string {
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return ""
+	}
+	if len(val) >= 8 && strings.Count(val, "-") == 0 {
+		return val[0:8]
+	}
+	if t, err := time.Parse("2006-01-02", val); err == nil {
+		return t.Format("20060102")
+	}
+	if len(val) >= 10 {
+		if t, err := time.Parse("2006-01-02 15:04:05", val[0:19]); err == nil {
+			return t.Format("20060102")
+		}
+	}
+	return ""
+}
+
+func composeClueID(phoneA, phoneB, dateRaw string) string {
+	a := strings.TrimSpace(phoneA)
+	b := strings.TrimSpace(phoneB)
+	if a == "" || b == "" {
+		return ""
+	}
+	dt := normalizeDateToCompact(dateRaw)
+	if dt == "" {
+		return ""
+	}
+	if lessOrEqualNumericString(a, b) {
+		return a + "-" + b + "-" + dt
+	}
+	return b + "-" + a + "-" + dt
+}
+
+func (s *server) importFeedbackToHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	db := s.bizDB()
+	schema := ""
+	if s.externalDB == nil {
+		schema = strings.TrimSpace(runtimeConfig.ExternalMySQL.Database)
+		if schema == "" {
+			schema = "wxzdb"
+		}
+	}
+
+	tbl := func(name string) string {
+		if schema == "" {
+			return "`" + name + "`"
+		}
+		return "`" + schema + "`.`" + name + "`"
+	}
+
+	rows, err := db.Query(`SELECT id, feedback_content, feedback_userId, feedback_time, mid, feedback_username FROM ` + tbl("feedback"))
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	imported := 0
+	skipped := 0
+	failed := 0
+	failedExamples := make([]string, 0, 10)
+	appendFailedExample := func(sourceID, reason string) {
+		if len(failedExamples) >= 10 {
+			return
+		}
+		failedExamples = append(failedExamples, fmt.Sprintf("source_feedback_id=%s: %s", sourceID, reason))
+	}
+
+	for rows.Next() {
+		var sourceFeedbackID, content, userID, feedbackTimeRaw, mid, userName string
+		if err := rows.Scan(&sourceFeedbackID, &content, &userID, &feedbackTimeRaw, &mid, &userName); err != nil {
+			failed++
+			appendFailedExample("(scan_row)", err.Error())
+			continue
+		}
+
+		var mappedFeedbackID int64
+		if err := db.QueryRow(`SELECT feedback_id FROM `+tbl("feedback2nb_tab_grjd_feedback_history")+` WHERE source_feedback_id = ?`, sourceFeedbackID).Scan(&mappedFeedbackID); err == nil {
+			skipped++
+			continue
+		}
+
+		var jfhm, ddhm, jgrq sql.NullString
+		if err := db.QueryRow(`SELECT jfhm, ddhm, jgrq FROM `+tbl("grjdmxjg_za")+` WHERE id = ? LIMIT 1`, mid).Scan(&jfhm, &ddhm, &jgrq); err != nil {
+			failed++
+			appendFailedExample(sourceFeedbackID, "lookup grjdmxjg_za failed: "+err.Error())
+			continue
+		}
+
+		clueID := composeClueID(jfhm.String, ddhm.String, jgrq.String)
+		if clueID == "" {
+			skipped++
+			continue
+		}
+
+		feedbackTime := time.Now()
+		if parsed, err := time.Parse("2006-01-02 15:04:05", strings.TrimSpace(feedbackTimeRaw)); err == nil {
+			feedbackTime = parsed
+		}
+
+		result, err := db.Exec(`
+			INSERT INTO `+tbl("nb_tab_grjd_feedback_history")+` (clue_id, feedback_content, feedback_userId, feedback_username, remark, feedback_time)
+			VALUES (?, ?, ?, ?, '', ?)`,
+			clueID, content, userID, userName, feedbackTime,
+		)
+		if err != nil {
+			failed++
+			appendFailedExample(sourceFeedbackID, "insert feedback_history failed: "+err.Error())
+			continue
+		}
+
+		newFeedbackID, idErr := result.LastInsertId()
+		if idErr != nil {
+			failed++
+			appendFailedExample(sourceFeedbackID, "read last insert id failed: "+idErr.Error())
+			continue
+		}
+
+		if _, err := db.Exec(`
+			INSERT INTO `+tbl("feedback2nb_tab_grjd_feedback_history")+` (source_feedback_id, feedback_id)
+			VALUES (?, ?)
+			ON DUPLICATE KEY UPDATE feedback_id = VALUES(feedback_id)`, sourceFeedbackID, newFeedbackID); err != nil {
+			failed++
+			appendFailedExample(sourceFeedbackID, "insert mapping failed: "+err.Error())
+			continue
+		}
+
+		imported++
+	}
+
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"source_table":    "feedback",
+			"target_table":    "nb_tab_grjd_feedback_history",
+			"imported":        imported,
+			"skipped":         skipped,
+			"failed":          failed,
+			"failed_examples": failedExamples,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) importDistributeToWorkflow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	if err := s.ensureWorkflowTable(); err != nil {
+		internalError(w, err)
+		return
+	}
+	if err := s.ensureDistributeTable(); err != nil {
+		internalError(w, err)
+		return
+	}
+
+	insertOrUpdate, updatedDistribute, updatedLevel, err := s.syncWorkflowDistributeWithStats()
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"source_table":       "grjd_distribute",
+			"target_table":       "nb_tab_grjd_workflow_state",
+			"insert_or_update":   insertOrUpdate,
+			"updated_distribute": updatedDistribute,
+			"updated_level":      updatedLevel,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func (s *server) initWorkflowState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	inserted, updated, err := s.rebuildWorkflowStateFromSummary()
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:    "0",
+		Message: "OK",
+		Data: map[string]interface{}{
+			"target_table": "nb_tab_grjd_workflow_state",
+			"inserted":     inserted,
+			"updated":      updated,
+		},
+		TraceID: traceID(),
+	})
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	writeJSON(w, http.StatusMethodNotAllowed, apiResponse{
+		Code:    "405",
+		Message: "method not allowed",
+		Data:    map[string]interface{}{},
+		TraceID: traceID(),
+	})
+}
+
+func badRequest(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusBadRequest, apiResponse{Code: "400", Message: msg, Data: map[string]interface{}{}, TraceID: traceID()})
+}
+
+func notFound(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusNotFound, apiResponse{Code: "404", Message: msg, Data: map[string]interface{}{}, TraceID: traceID()})
+}
+
+func internalError(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusInternalServerError, apiResponse{Code: "500", Message: err.Error(), Data: map[string]interface{}{}, TraceID: traceID()})
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v apiResponse) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func traceID() string {
+	return "trc_" + time.Now().Format("20060102_150405")
+}
+
+func getDialogueQuickPrompts() []string {
+	cfgPrompts := make([]string, 0, len(runtimeConfig.Dialogue.QuickPrompts))
+	for _, prompt := range runtimeConfig.Dialogue.QuickPrompts {
+		trimmed := strings.TrimSpace(prompt)
+		if trimmed != "" {
+			cfgPrompts = append(cfgPrompts, trimmed)
+		}
+	}
+	if len(cfgPrompts) > 0 {
+		return cfgPrompts
+	}
+	return []string{
+		"请给出该对象未来24小时风险变化判断。",
+		"请输出核查员可执行的三步处置建议。",
+		"请生成150字研判摘要并标注引用依据。",
+	}
+}
+
+func registerFrontendRoutes(mux *http.ServeMux) {
+	distDir := resolveStaticDir()
+	if distDir == "" {
+		log.Printf("frontend static dir not found, API-only mode")
+		return
+	}
+
+	fileServer := http.FileServer(http.Dir(distDir))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			notFound(w, "route not found")
+			return
+		}
+
+		cleanPath := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		target := filepath.Join(distDir, cleanPath)
+		if cleanPath == "" {
+			target = filepath.Join(distDir, "index.html")
+		}
+		if info, err := os.Stat(target); err == nil && !info.IsDir() {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(distDir, "index.html"))
+	})
+	log.Printf("frontend static serving enabled: %s", distDir)
+}
+
+func resolveStaticDir() string {
+	candidates := []string{}
+	if v := strings.TrimSpace(os.Getenv("PRISM_STATIC_DIR")); v != "" {
+		candidates = append(candidates, v)
+	}
+	candidates = append(candidates, "../frontend/dist", "frontend/dist", "./dist")
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func envOrDefault(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+
+	switch key {
+	case "SERVER_ADDR":
+		if strings.TrimSpace(runtimeConfig.Backend.ServerAddr) != "" {
+			return runtimeConfig.Backend.ServerAddr
+		}
+	case "DEEPSEEK_API_BASE":
+		if strings.TrimSpace(runtimeConfig.LLM.APIBase) != "" {
+			return runtimeConfig.LLM.APIBase
+		}
+	case "DEEPSEEK_MODEL_NAME":
+		if strings.TrimSpace(runtimeConfig.LLM.ModelName) != "" {
+			return runtimeConfig.LLM.ModelName
+		}
+	case "DEEPSEEK_API_KEY":
+		if strings.TrimSpace(runtimeConfig.LLM.APIKey) != "" {
+			return runtimeConfig.LLM.APIKey
+		}
+	}
+
+	return fallback
+}
+
+func loadAppConfig() appConfig {
+	var cfg appConfig
+	paths := []string{}
+	if p := strings.TrimSpace(os.Getenv("PRISM_CONFIG_PATH")); p != "" {
+		paths = append(paths, p)
+	}
+	paths = append(paths, "../config/prism-config.json", "config/prism-config.json")
+
+	for _, p := range paths {
+		content, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		content = bytes.TrimPrefix(content, []byte{0xEF, 0xBB, 0xBF})
+		if err := json.Unmarshal(content, &cfg); err == nil {
+			runtimeConfigPath = p
+			return cfg
+		}
+	}
+
+	return cfg
+}
+
+func schemaFromDSN(dsn string) string {
+	raw := strings.TrimSpace(dsn)
+	if raw == "" {
+		return ""
+	}
+	slash := strings.LastIndex(raw, "/")
+	if slash < 0 || slash+1 >= len(raw) {
+		return ""
+	}
+	part := raw[slash+1:]
+	if q := strings.Index(part, "?"); q >= 0 {
+		part = part[:q]
+	}
+	return strings.TrimSpace(part)
+}
+
+func (s *server) validateExternalDBConfig() error {
+	extDSN := strings.TrimSpace(runtimeConfig.ExternalMySQL.DSN)
+	extDB := strings.TrimSpace(runtimeConfig.ExternalMySQL.Database)
+	dsnDB := schemaFromDSN(extDSN)
+
+	if extDSN != "" && extDB == "" && dsnDB != "" {
+		// Keep behavior config-driven by deriving empty database field from the same config object.
+		runtimeConfig.ExternalMySQL.Database = dsnDB
+		extDB = dsnDB
+	}
+
+	if extDSN != "" && extDB != "" && dsnDB != "" && !strings.EqualFold(extDB, dsnDB) {
+		return fmt.Errorf(
+			"external_mysql config mismatch: database=%q but dsn schema=%q; please align prism-config.json",
+			extDB, dsnDB,
+		)
+	}
+	return nil
+}
+
+func pathSegment(path string, idx int) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if idx >= 0 && idx < len(parts) {
+		return parts[idx]
+	}
+	return ""
+}
+
+func nonEmpty(val string, fallback string) string {
+	if strings.TrimSpace(val) == "" {
+		return fallback
+	}
+	return val
+}
+
+func resolveStatus(current string, hasFeedback bool) string {
+	st := nonEmpty(current, "待核查")
+	if st == "已处置" {
+		return st
+	}
+	if hasFeedback {
+		return "已反馈"
+	}
+	return st
+}
+
+func canonicalID(id string) string {
+	a, b, dt, ok := splitID(id)
+	if !ok {
+		return id
+	}
+	if lessOrEqualNumericString(a, b) {
+		return a + "-" + b + "-" + dt
+	}
+	return b + "-" + a + "-" + dt
+}
+
+func reverseID(id string) string {
+	a, b, dt, ok := splitID(id)
+	if !ok {
+		return id
+	}
+	return b + "-" + a + "-" + dt
+}
+
+func splitID(id string) (string, string, string, bool) {
+	parts := strings.Split(id, "-")
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
+}
+
+func lessOrEqualNumericString(a, b string) bool {
+	aTrim := strings.TrimLeft(a, "0")
+	bTrim := strings.TrimLeft(b, "0")
+	if aTrim == "" {
+		aTrim = "0"
+	}
+	if bTrim == "" {
+		bTrim = "0"
+	}
+	if len(aTrim) != len(bTrim) {
+		return len(aTrim) < len(bTrim)
+	}
+	return aTrim <= bTrim
+}
+
+func (s *server) ensureWorkflowTable() error {
+	workflowTable := s.bizTable("nb_tab_grjd_workflow_state")
+	_, err := s.bizDB().Exec(`
+		CREATE TABLE IF NOT EXISTS ` + workflowTable + ` (
+            id VARCHAR(64) PRIMARY KEY,
+            status VARCHAR(16) NOT NULL DEFAULT '待核查',
+			level VARCHAR(32) NULL,
+            remark TEXT NULL,
+            mark_tag VARCHAR(64) NULL,
+			distribute VARCHAR(64) NOT NULL DEFAULT '',
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	if err != nil {
+		return err
+	}
+	hasFeedback, err := s.hasColumn("nb_tab_grjd_workflow_state", "feedback")
+	if err != nil {
+		return err
+	}
+	if hasFeedback {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + workflowTable + ` DROP COLUMN feedback`); err != nil {
+			return err
+		}
+	}
+	hasDistribute, err := s.hasColumn("nb_tab_grjd_workflow_state", "distribute")
+	if err != nil {
+		return err
+	}
+	if !hasDistribute {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + workflowTable + ` ADD COLUMN distribute VARCHAR(64) NOT NULL DEFAULT '' AFTER mark_tag`); err != nil {
+			return err
+		}
+	}
+	hasClaimedBy, err := s.hasColumn("nb_tab_grjd_workflow_state", "claimed_by")
+	if err != nil {
+		return err
+	}
+	if hasClaimedBy {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + workflowTable + ` DROP COLUMN claimed_by`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *server) ensureDistributeTable() error {
+	distributeTable := s.bizTable("grjd_distribute")
+	_, err := s.bizDB().Exec(`
+		CREATE TABLE IF NOT EXISTS ` + distributeTable + ` (
+			clue_id VARCHAR(64) PRIMARY KEY,
+			level VARCHAR(128) NOT NULL,
+			assign_to VARCHAR(64) NOT NULL,
+			model_name VARCHAR(128) NOT NULL,
+			tag VARCHAR(64) NOT NULL,
+			assigned_time DATETIME NOT NULL,
+			remark TEXT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	if err != nil {
+		return err
+	}
+
+	hasFxdj, err := s.hasColumn("grjd_distribute", "fxdj")
+	if err != nil {
+		return err
+	}
+	hasLevel, err := s.hasColumn("grjd_distribute", "level")
+	if err != nil {
+		return err
+	}
+	if hasFxdj && !hasLevel {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + distributeTable + ` CHANGE COLUMN fxdj level VARCHAR(128) NOT NULL`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *server) ensureFeedbackMappingTable() error {
+	_, err := s.bizDB().Exec(`
+		CREATE TABLE IF NOT EXISTS ` + s.bizTable("feedback2nb_tab_grjd_feedback_history") + ` (
+			source_feedback_id VARCHAR(100) PRIMARY KEY,
+			feedback_id BIGINT UNSIGNED NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			KEY idx_feedback_id (feedback_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	return err
+}
+
+func (s *server) ensureZaFeedbackBitNormalized() error {
+	if _, err := s.bizDB().Exec(`UPDATE ` + s.bizTable("grjdmxjg_za") + ` SET is_feedback = b'1'`); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "doesn't exist") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *server) ensureMessageAndSummaryTables() error {
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS nb_tab_grjd_message (
+			id VARCHAR(36) NOT NULL COMMENT 'primary id',
+			capture_time TIMESTAMP NULL DEFAULT NULL COMMENT 'capture time',
+			msisdn VARCHAR(20) DEFAULT NULL COMMENT 'phone number',
+			calltype VARCHAR(4) DEFAULT NULL COMMENT 'call type',
+			message VARCHAR(1024) DEFAULT NULL COMMENT 'message body',
+			dt BIGINT(8) DEFAULT NULL COMMENT 'data date (yyyymmdd)'
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='message detail table'`); err != nil {
+		return err
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS nb_tab_grjd_summary (
+			id VARCHAR(36) NOT NULL COMMENT 'id',
+			type VARCHAR(8) DEFAULT NULL COMMENT 'clue type',
+			msisdn_1 VARCHAR(20) DEFAULT NULL COMMENT 'phone number 1',
+			msisdn_2 VARCHAR(20) DEFAULT NULL COMMENT 'phone number 2',
+			cnt DECIMAL(8,0) DEFAULT NULL COMMENT 'message count',
+			cnt_dt DECIMAL(2,0) DEFAULT NULL COMMENT 'active days in 10d',
+			message TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'message context',
+			summary VARCHAR(1024) DEFAULT NULL COMMENT 'ai summary',
+			score DOUBLE(8,2) DEFAULT NULL COMMENT 'risk score',
+			qklx VARCHAR(255) DEFAULT NULL COMMENT 'record type',
+			label2 VARCHAR(255) DEFAULT NULL COMMENT 'peer label',
+			user_id VARCHAR(32) DEFAULT NULL COMMENT 'user id',
+			user_name VARCHAR(8) DEFAULT NULL COMMENT 'user name',
+			status INT(2) DEFAULT '0' COMMENT 'status',
+			update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'updated at',
+			dt DATE DEFAULT NULL COMMENT 'data date',
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='summary table'`); err != nil {
+		return err
+	}
+
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_message MODIFY COLUMN id VARCHAR(36) NOT NULL COMMENT 'primary id'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_message MODIFY COLUMN capture_time TIMESTAMP NULL DEFAULT NULL COMMENT 'capture time'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_message MODIFY COLUMN msisdn VARCHAR(20) DEFAULT NULL COMMENT 'phone number'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_message MODIFY COLUMN calltype VARCHAR(4) DEFAULT NULL COMMENT 'call type'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_message MODIFY COLUMN message VARCHAR(1024) DEFAULT NULL COMMENT 'message body'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_message MODIFY COLUMN dt BIGINT(8) DEFAULT NULL COMMENT 'data date (yyyymmdd)'`)
+
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN id VARCHAR(36) NOT NULL COMMENT 'id'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN type VARCHAR(8) DEFAULT NULL COMMENT 'clue type'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN msisdn_1 VARCHAR(20) DEFAULT NULL COMMENT 'phone number 1'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN msisdn_2 VARCHAR(20) DEFAULT NULL COMMENT 'phone number 2'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN cnt DECIMAL(8,0) DEFAULT NULL COMMENT 'message count'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN cnt_dt DECIMAL(2,0) DEFAULT NULL COMMENT 'active days in 10d'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN message TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'message context'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN summary VARCHAR(1024) DEFAULT NULL COMMENT 'ai summary'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN score DOUBLE(8,2) DEFAULT NULL COMMENT 'risk score'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN qklx VARCHAR(255) DEFAULT NULL COMMENT 'record type'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN label2 VARCHAR(255) DEFAULT NULL COMMENT 'peer label'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN user_id VARCHAR(32) DEFAULT NULL COMMENT 'user id'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN user_name VARCHAR(8) DEFAULT NULL COMMENT 'user name'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN status INT(2) DEFAULT '0' COMMENT 'status'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'updated at'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary MODIFY COLUMN dt DATE DEFAULT NULL COMMENT 'data date'`)
+	_, _ = s.db.Exec(`ALTER TABLE nb_tab_grjd_summary ADD PRIMARY KEY (id)`)
+
+	return nil
+}
+
+func (s *server) hasColumn(tableName, columnName string) (bool, error) {
+	var count int
+	schema := s.bizSchemaName()
+	if schema == "" {
+		err := s.bizDB().QueryRow(`
+			SELECT COUNT(1)
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			AND TABLE_NAME = ?
+			AND COLUMN_NAME = ?`, tableName, columnName).Scan(&count)
+		if err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
+	err := s.bizDB().QueryRow(`
+		SELECT COUNT(1)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ?
+		AND TABLE_NAME = ?
+		AND COLUMN_NAME = ?`, schema, tableName, columnName).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (s *server) ensureFeedbackHistoryTable() error {
+	feedbackHistoryTable := s.bizTable("nb_tab_grjd_feedback_history")
+	_, err := s.bizDB().Exec(`
+		CREATE TABLE IF NOT EXISTS ` + feedbackHistoryTable + ` (
+			feedback_id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+			clue_id VARCHAR(64) NOT NULL,
+			feedback_content TEXT NOT NULL,
+			feedback_userId VARCHAR(64) NULL,
+			feedback_username VARCHAR(64) NULL,
+			remark TEXT NULL,
+			feedback_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			KEY idx_feedback_id_time (clue_id, feedback_time)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	if err != nil {
+		return err
+	}
+
+	hasID, err := s.hasColumn("nb_tab_grjd_feedback_history", "id")
+	if err != nil {
+		return err
+	}
+	hasClueID, err := s.hasColumn("nb_tab_grjd_feedback_history", "clue_id")
+	if err != nil {
+		return err
+	}
+	if hasID && !hasClueID {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + feedbackHistoryTable + ` CHANGE COLUMN id clue_id VARCHAR(64) NOT NULL`); err != nil {
+			return err
+		}
+	}
+
+	hasFeedbackUserID, err := s.hasColumn("nb_tab_grjd_feedback_history", "feedback_userId")
+	if err != nil {
+		return err
+	}
+	if !hasFeedbackUserID {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + feedbackHistoryTable + ` ADD COLUMN feedback_userId VARCHAR(64) NULL AFTER feedback_content`); err != nil {
+			return err
+		}
+	}
+
+	hasFeedbackUserName, err := s.hasColumn("nb_tab_grjd_feedback_history", "feedback_username")
+	if err != nil {
+		return err
+	}
+	if !hasFeedbackUserName {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + feedbackHistoryTable + ` ADD COLUMN feedback_username VARCHAR(64) NULL AFTER feedback_userId`); err != nil {
+			return err
+		}
+	}
+
+	hasRemark, err := s.hasColumn("nb_tab_grjd_feedback_history", "remark")
+	if err != nil {
+		return err
+	}
+	if !hasRemark {
+		if _, err := s.bizDB().Exec(`ALTER TABLE ` + feedbackHistoryTable + ` ADD COLUMN remark TEXT NULL AFTER feedback_username`); err != nil {
+			return err
+		}
+	}
+
+	_, _ = s.bizDB().Exec(`ALTER TABLE ` + feedbackHistoryTable + ` DROP INDEX idx_feedback_id_time`)
+	_, _ = s.bizDB().Exec(`ALTER TABLE ` + feedbackHistoryTable + ` ADD INDEX idx_feedback_id_time (clue_id, feedback_time)`)
+
+	return nil
+}
+
+func (s *server) syncFeedbackStatusFromHistory() error {
+	_, err := s.bizDB().Exec(`
+		INSERT INTO ` + s.bizTable("nb_tab_grjd_workflow_state") + ` (id, status)
+		SELECT DISTINCT clue_id, '已反馈'
+		FROM ` + s.bizTable("nb_tab_grjd_feedback_history") + `
+		ON DUPLICATE KEY UPDATE
+			status = IF(status = '已处置', status, '已反馈')`)
+	return err
+}
+
+func (s *server) syncWorkflowDistribute() error {
+	_, _, _, err := s.syncWorkflowDistributeWithStats()
+	return err
+}
+
+func (s *server) syncWorkflowDistributeWithStats() (int64, int64, int64, error) {
+	resInsert, err := s.bizDB().Exec(`
+		INSERT INTO ` + s.bizTable("nb_tab_grjd_workflow_state") + ` (id, status, level, distribute)
+		SELECT clue_id, '待核查', level, tag
+		FROM ` + s.bizTable("grjd_distribute") + `
+		ON DUPLICATE KEY UPDATE
+			level = VALUES(level),
+			distribute = VALUES(distribute)`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	insertOrUpdate, _ := resInsert.RowsAffected()
+
+	resDistribute, err := s.bizDB().Exec(`
+		UPDATE ` + s.bizTable("nb_tab_grjd_workflow_state") + ` w
+		LEFT JOIN ` + s.bizTable("grjd_distribute") + ` d ON w.id = d.clue_id
+		SET w.distribute = COALESCE(d.tag, '')`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	updatedDistribute, _ := resDistribute.RowsAffected()
+
+	resLevel, err := s.bizDB().Exec(`
+		UPDATE ` + s.bizTable("nb_tab_grjd_workflow_state") + ` w
+		JOIN ` + s.bizTable("grjd_distribute") + ` d ON w.id = d.clue_id
+		SET w.level = d.level`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	updatedLevel, _ := resLevel.RowsAffected()
+	return insertOrUpdate, updatedDistribute, updatedLevel, nil
+}
+
+func (s *server) rebuildWorkflowStateFromSummary() (int64, int64, error) {
+	if err := s.ensureWorkflowTable(); err != nil {
+		return 0, 0, err
+	}
+	if err := s.ensureDistributeTable(); err != nil {
+		return 0, 0, err
+	}
+	if err := s.ensureFeedbackHistoryTable(); err != nil {
+		return 0, 0, err
+	}
+
+	summaryRows, err := s.db.Query(`SELECT id FROM nb_tab_grjd_summary`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer summaryRows.Close()
+
+	summaryIDs := make([]string, 0, 4096)
+	for summaryRows.Next() {
+		var id string
+		if err := summaryRows.Scan(&id); err != nil {
+			return 0, 0, err
+		}
+		summaryIDs = append(summaryIDs, canonicalID(id))
+	}
+	if err := summaryRows.Err(); err != nil {
+		return 0, 0, err
+	}
+	if len(summaryIDs) == 0 {
+		return 0, 0, nil
+	}
+
+	existingRows, err := s.bizDB().Query(`SELECT id FROM ` + s.bizTable("nb_tab_grjd_workflow_state"))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer existingRows.Close()
+	existing := map[string]bool{}
+	for existingRows.Next() {
+		var id string
+		if err := existingRows.Scan(&id); err != nil {
+			return 0, 0, err
+		}
+		existing[canonicalID(id)] = true
+	}
+	if err := existingRows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	feedbackRows, err := s.bizDB().Query(`SELECT DISTINCT clue_id FROM ` + s.bizTable("nb_tab_grjd_feedback_history"))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer feedbackRows.Close()
+	feedbackSet := map[string]bool{}
+	for feedbackRows.Next() {
+		var clueID string
+		if err := feedbackRows.Scan(&clueID); err != nil {
+			return 0, 0, err
+		}
+		feedbackSet[canonicalID(clueID)] = true
+	}
+	if err := feedbackRows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	type distributeInfo struct {
+		level      sql.NullString
+		distribute string
+	}
+	distributeRows, err := s.bizDB().Query(`SELECT clue_id, level, tag FROM ` + s.bizTable("grjd_distribute"))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer distributeRows.Close()
+	distributeMap := map[string]distributeInfo{}
+	for distributeRows.Next() {
+		var clueID string
+		var level sql.NullString
+		var tag sql.NullString
+		if err := distributeRows.Scan(&clueID, &level, &tag); err != nil {
+			return 0, 0, err
+		}
+		distributeMap[canonicalID(clueID)] = distributeInfo{
+			level:      level,
+			distribute: strings.TrimSpace(tag.String),
+		}
+	}
+	if err := distributeRows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	tx, err := s.bizDB().Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO ` + s.bizTable("nb_tab_grjd_workflow_state") + ` (id, status, level, distribute, updated_at)
+		VALUES (?, ?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE
+			status = VALUES(status),
+			level = VALUES(level),
+			distribute = VALUES(distribute),
+			updated_at = VALUES(updated_at)`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer stmt.Close()
+
+	inserted := int64(0)
+	updated := int64(0)
+	for _, id := range summaryIDs {
+		status := "待核查"
+		if feedbackSet[id] {
+			status = "已反馈"
+		}
+		info := distributeMap[id]
+		levelArg := interface{}(nil)
+		if info.level.Valid && strings.TrimSpace(info.level.String) != "" {
+			levelArg = strings.TrimSpace(info.level.String)
+		}
+		if _, err := stmt.Exec(id, status, levelArg, info.distribute); err != nil {
+			return inserted, updated, err
+		}
+		updated++
+		if !existing[id] {
+			inserted++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return inserted, updated, err
+	}
+	committed = true
+	return inserted, updated, nil
+}
+
+func (s *server) loadLatestFeedbackMap(ids []string) (map[string]feedbackHistoryRow, error) {
+	result := map[string]feedbackHistoryRow{}
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	idSet := map[string]bool{}
+	for _, id := range ids {
+		canonical := canonicalID(id)
+		idSet[canonical] = true
+		idSet[reverseID(canonical)] = true
+	}
+
+	placeholders := make([]string, 0, len(idSet))
+	args := make([]interface{}, 0, len(idSet))
+	for id := range idSet {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT clue_id, feedback_content, DATE_FORMAT(feedback_time, '%%Y-%%m-%%d %%H:%%i:%%s'), feedback_username
+		FROM %s
+		WHERE clue_id IN (%s)
+		ORDER BY feedback_time DESC`, s.bizTable("nb_tab_grjd_feedback_history"), strings.Join(placeholders, ","))
+
+	rows, err := s.bizDB().Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item feedbackHistoryRow
+		if err := rows.Scan(&item.ID, &item.Feedback, &item.FeedbackTime, &item.FeedbackUserName); err != nil {
+			return nil, err
+		}
+		canonical := canonicalID(item.ID)
+		item.ID = canonical
+		if _, exists := result[canonical]; !exists {
+			result[canonical] = item
+		}
+	}
+
+	return result, rows.Err()
+}
+
+func (s *server) loadCanonicalSummariesWithState(keyword string) ([]summaryRow, map[string]workflowState, error) {
+	rows, err := s.db.Query(`
+	SELECT id, type, msisdn_1, msisdn_2, cnt, cnt_dt, summary, score,
+		 qklx, label2, user_id, user_name, status,
+		 COALESCE(DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s'), '') AS update_time,
+		 COALESCE(
+			 DATE_FORMAT(dt, '%Y-%m-%d'),
+			 CASE
+				 WHEN CHAR_LENGTH(TRIM(CAST(dt AS CHAR))) = 8
+				 THEN CONCAT(
+					 SUBSTRING(TRIM(CAST(dt AS CHAR)), 1, 4), '-',
+					 SUBSTRING(TRIM(CAST(dt AS CHAR)), 5, 2), '-',
+					 SUBSTRING(TRIM(CAST(dt AS CHAR)), 7, 2)
+				 )
+				 WHEN CHAR_LENGTH(TRIM(CAST(dt AS CHAR))) >= 10
+				 THEN SUBSTRING(TRIM(CAST(dt AS CHAR)), 1, 10)
+				 ELSE ''
+			 END,
+			 ''
+		 ) AS data_date
+        FROM nb_tab_grjd_summary`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	grouped := map[string]summaryRow{}
+	for rows.Next() {
+		var item summaryRow
+		if err := rows.Scan(
+			&item.ID,
+			&item.Type,
+			&item.Msisdn1,
+			&item.Msisdn2,
+			&item.Cnt,
+			&item.CntDt,
+			&item.Summary,
+			&item.Score,
+			&item.Qklx,
+			&item.Label2,
+			&item.UserID,
+			&item.UserName,
+			&item.Status,
+			&item.UpdateTime,
+			&item.DataDate,
+		); err != nil {
+			return nil, nil, err
+		}
+
+		item.Msisdn1, item.Msisdn2 = canonicalPair(item.Msisdn1, item.Msisdn2)
+		_, _, dt, ok := splitID(item.ID)
+		if ok {
+			item.ID = item.Msisdn1 + "-" + item.Msisdn2 + "-" + dt
+		} else {
+			item.ID = canonicalID(item.ID)
+		}
+		canonical := item.ID
+		if keyword != "" {
+			if !strings.Contains(canonical, keyword) &&
+				!strings.Contains(item.Msisdn1, keyword) &&
+				!strings.Contains(item.Msisdn2, keyword) &&
+				!strings.Contains(item.Summary, keyword) {
+				continue
+			}
+		}
+
+		prev, exists := grouped[canonical]
+		if !exists {
+			grouped[canonical] = item
+			continue
+		}
+
+		if item.UpdateTime > prev.UpdateTime {
+			grouped[canonical] = item
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	ids := make([]string, 0, len(grouped))
+	list := make([]summaryRow, 0, len(grouped))
+	for _, item := range grouped {
+		ids = append(ids, item.ID)
+		list = append(list, item)
+	}
+	slices.Sort(ids)
+	slices.SortFunc(list, func(a, b summaryRow) int { return cmp.Compare(a.ID, b.ID) })
+
+	state, err := s.loadWorkflowMap()
+	if err != nil {
+		return nil, nil, err
+	}
+	return list, state, nil
+}
+
+func (s *server) loadSummariesPage(filters clueFilters, page, pageSize int) ([]summaryRow, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
+	dataDateExpr := `COALESCE(
+         DATE_FORMAT(s.dt, '%Y-%m-%d'),
+         CASE
+           WHEN CHAR_LENGTH(TRIM(CAST(s.dt AS CHAR))) = 8
+           THEN CONCAT(
+             SUBSTRING(TRIM(CAST(s.dt AS CHAR)), 1, 4), '-',
+             SUBSTRING(TRIM(CAST(s.dt AS CHAR)), 5, 2), '-',
+             SUBSTRING(TRIM(CAST(s.dt AS CHAR)), 7, 2)
+           )
+           WHEN CHAR_LENGTH(TRIM(CAST(s.dt AS CHAR))) >= 10
+           THEN SUBSTRING(TRIM(CAST(s.dt AS CHAR)), 1, 10)
+           ELSE ''
+         END,
+         ''
+       )`
+
+	coreWhereParts := make([]string, 0, 12)
+	coreArgs := make([]interface{}, 0, 20)
+	if filters.Keyword != "" {
+		like := "%" + filters.Keyword + "%"
+		coreWhereParts = append(coreWhereParts, "(s.id LIKE ? OR s.msisdn_1 LIKE ? OR s.msisdn_2 LIKE ? OR s.summary LIKE ? OR s.type LIKE ? OR s.qklx LIKE ?)")
+		for i := 0; i < 6; i++ {
+			coreArgs = append(coreArgs, like)
+		}
+	}
+	if filters.ScoreMin != nil {
+		coreWhereParts = append(coreWhereParts, "s.score >= ?")
+		coreArgs = append(coreArgs, *filters.ScoreMin)
+	}
+	if filters.ScoreMax != nil {
+		coreWhereParts = append(coreWhereParts, "s.score <= ?")
+		coreArgs = append(coreArgs, *filters.ScoreMax)
+	}
+	if filters.DataDateFrom != "" {
+		coreWhereParts = append(coreWhereParts, dataDateExpr+" >= ?")
+		coreArgs = append(coreArgs, filters.DataDateFrom)
+	}
+	if filters.DataDateTo != "" {
+		coreWhereParts = append(coreWhereParts, dataDateExpr+" <= ?")
+		coreArgs = append(coreArgs, filters.DataDateTo)
+	}
+	coreWhere := ""
+	if len(coreWhereParts) > 0 {
+		coreWhere = " WHERE " + strings.Join(coreWhereParts, " AND ")
+	}
+
+	querySQL := `
+SELECT s.id, s.type, s.msisdn_1, s.msisdn_2, s.cnt, s.cnt_dt, s.summary, s.score,
+       s.qklx, s.label2, s.user_id, s.user_name, s.status,
+       COALESCE(DATE_FORMAT(s.update_time, '%Y-%m-%d %H:%i:%s'), '') AS update_time,
+       ` + dataDateExpr + ` AS data_date
+ FROM nb_tab_grjd_summary s` + coreWhere + `
+ ORDER BY s.update_time DESC
+`
+	rows, err := s.db.Query(querySQL, coreArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	allRows := make([]summaryRow, 0, pageSize)
+	for rows.Next() {
+		var item summaryRow
+		if err := rows.Scan(
+			&item.ID, &item.Type, &item.Msisdn1, &item.Msisdn2, &item.Cnt, &item.CntDt,
+			&item.Summary, &item.Score, &item.Qklx, &item.Label2, &item.UserID, &item.UserName,
+			&item.Status, &item.UpdateTime, &item.DataDate,
+		); err != nil {
+			return nil, 0, err
+		}
+		item.Msisdn1, item.Msisdn2 = canonicalPair(item.Msisdn1, item.Msisdn2)
+		item.ID = canonicalID(item.ID)
+		allRows = append(allRows, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	if len(allRows) == 0 {
+		return []summaryRow{}, 0, nil
+	}
+
+	ids := make([]string, 0, len(allRows))
+	for _, row := range allRows {
+		ids = append(ids, row.ID)
+	}
+	if err := s.ensureWorkflowRows(ids); err != nil {
+		return nil, 0, err
+	}
+	workflow, err := s.loadWorkflowMapByIDsChunked(ids, 500)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	filtered := make([]summaryRow, 0, len(allRows))
+	for _, row := range allRows {
+		st := workflow[row.ID]
+		statusVal := strings.TrimSpace(st.Status)
+		if statusVal == "" {
+			statusVal = "待核查"
+		}
+		markVal := strings.TrimSpace(st.MarkTag.String)
+		distributeVal := strings.TrimSpace(st.Distribute.String)
+
+		if filters.Status != "" && statusVal != filters.Status {
+			continue
+		}
+		if filters.MarkTag != "" {
+			if filters.MarkTag == "__EMPTY__" {
+				if markVal != "" {
+					continue
+				}
+			} else if markVal != filters.MarkTag {
+				continue
+			}
+		}
+		if filters.Distribute != "" {
+			if filters.Distribute == "__EMPTY__" {
+				if distributeVal != "" {
+					continue
+				}
+			} else if distributeVal != filters.Distribute {
+				continue
+			}
+		}
+		filtered = append(filtered, row)
+	}
+
+	sortBy := strings.TrimSpace(filters.SortBy)
+	sortOrder := strings.ToLower(strings.TrimSpace(filters.SortOrder))
+	if sortOrder != "asc" && sortOrder != "desc" {
+		sortOrder = "desc"
+	}
+	allowedSortBy := map[string]bool{
+		"msisdn_1":   true,
+		"msisdn_2":   true,
+		"type":       true,
+		"qklx":       true,
+		"level":      true,
+		"score":      true,
+		"update_time": true,
+		"status":     true,
+		"distribute": true,
+	}
+	if !allowedSortBy[sortBy] {
+		sortBy = "update_time"
+		sortOrder = "desc"
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		a := filtered[i]
+		b := filtered[j]
+		wa := workflow[a.ID]
+		wb := workflow[b.ID]
+		va := ""
+		vb := ""
+		cmp := 0
+		switch sortBy {
+		case "msisdn_1":
+			va, vb = a.Msisdn1, b.Msisdn1
+			cmp = strings.Compare(va, vb)
+		case "msisdn_2":
+			va, vb = a.Msisdn2, b.Msisdn2
+			cmp = strings.Compare(va, vb)
+		case "type":
+			va, vb = a.Type, b.Type
+			cmp = strings.Compare(va, vb)
+		case "qklx":
+			va, vb = a.Qklx.String, b.Qklx.String
+			cmp = strings.Compare(va, vb)
+		case "level":
+			va, vb = wa.Level.String, wb.Level.String
+			cmp = strings.Compare(va, vb)
+		case "score":
+			if a.Score < b.Score {
+				cmp = -1
+			} else if a.Score > b.Score {
+				cmp = 1
+			}
+		case "status":
+			sa := strings.TrimSpace(wa.Status)
+			sb := strings.TrimSpace(wb.Status)
+			if sa == "" {
+				sa = "待核查"
+			}
+			if sb == "" {
+				sb = "待核查"
+			}
+			cmp = strings.Compare(sa, sb)
+		case "distribute":
+			va, vb = wa.Distribute.String, wb.Distribute.String
+			cmp = strings.Compare(va, vb)
+		default:
+			// Sort by data_date shown in list. Fallback to update_time then id for deterministic order.
+			va, vb = a.DataDate, b.DataDate
+			cmp = strings.Compare(va, vb)
+			if cmp == 0 {
+				cmp = strings.Compare(a.UpdateTime, b.UpdateTime)
+			}
+		}
+		if cmp == 0 {
+			cmp = strings.Compare(a.ID, b.ID)
+		}
+		if sortOrder == "asc" {
+			return cmp < 0
+		}
+		return cmp > 0
+	})
+
+	total := len(filtered)
+	if offset >= total {
+		return []summaryRow{}, total, nil
+	}
+	end := offset + pageSize
+	if end > total {
+		end = total
+	}
+	return filtered[offset:end], total, nil
+}
+
+func (s *server) loadWorkflowMapByIDsChunked(ids []string, chunkSize int) (map[string]workflowState, error) {
+	result := map[string]workflowState{}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	if chunkSize <= 0 {
+		chunkSize = 500
+	}
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part, err := s.loadWorkflowMapByIDs(ids[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range part {
+			result[k] = v
+		}
+	}
+	return result, nil
+}
+
+func (s *server) loadSummaryByID(clueID string) (*summaryRow, error) {
+	canonical := canonicalID(clueID)
+	reversed := reverseID(canonical)
+	row := s.db.QueryRow(`
+SELECT id, type, msisdn_1, msisdn_2, cnt, cnt_dt, summary, score,
+       qklx, label2, user_id, user_name, status,
+       COALESCE(DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s'), '') AS update_time,
+       COALESCE(
+         DATE_FORMAT(dt, '%Y-%m-%d'),
+         CASE
+           WHEN CHAR_LENGTH(TRIM(CAST(dt AS CHAR))) = 8
+           THEN CONCAT(
+             SUBSTRING(TRIM(CAST(dt AS CHAR)), 1, 4), '-',
+             SUBSTRING(TRIM(CAST(dt AS CHAR)), 5, 2), '-',
+             SUBSTRING(TRIM(CAST(dt AS CHAR)), 7, 2)
+           )
+           WHEN CHAR_LENGTH(TRIM(CAST(dt AS CHAR))) >= 10
+           THEN SUBSTRING(TRIM(CAST(dt AS CHAR)), 1, 10)
+           ELSE ''
+         END,
+         ''
+       ) AS data_date
+  FROM nb_tab_grjd_summary
+ WHERE id IN (?, ?)
+ ORDER BY update_time DESC
+ LIMIT 1`, canonical, reversed)
+
+	var item summaryRow
+	if err := row.Scan(
+		&item.ID, &item.Type, &item.Msisdn1, &item.Msisdn2, &item.Cnt, &item.CntDt, &item.Summary,
+		&item.Score, &item.Qklx, &item.Label2, &item.UserID, &item.UserName, &item.Status,
+		&item.UpdateTime, &item.DataDate,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	item.Msisdn1, item.Msisdn2 = canonicalPair(item.Msisdn1, item.Msisdn2)
+	item.ID = canonicalID(item.ID)
+	return &item, nil
+}
+
+func (s *server) ensureWorkflowRows(ids []string) error {
+	tx, err := s.bizDB().Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(`INSERT INTO ` + s.bizTable("nb_tab_grjd_workflow_state") + ` (id, status) VALUES (?, '待核查') ON DUPLICATE KEY UPDATE id=id`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, id := range ids {
+		if _, err := stmt.Exec(id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *server) loadWorkflowMap() (map[string]workflowState, error) {
+	rows, err := s.bizDB().Query(`SELECT id, status, level, remark, mark_tag, distribute FROM ` + s.bizTable("nb_tab_grjd_workflow_state"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := map[string]workflowState{}
+	for rows.Next() {
+		var item workflowState
+		if err := rows.Scan(&item.ID, &item.Status, &item.Level, &item.Remark, &item.MarkTag, &item.Distribute); err != nil {
+			return nil, err
+		}
+		result[item.ID] = item
+	}
+	return result, rows.Err()
+}
+
+func (s *server) loadWorkflowMapByIDs(ids []string) (map[string]workflowState, error) {
+	result := map[string]workflowState{}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]interface{}, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	rows, err := s.bizDB().Query(
+		`SELECT id, status, level, remark, mark_tag, distribute FROM `+s.bizTable("nb_tab_grjd_workflow_state")+` WHERE id IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item workflowState
+		if err := rows.Scan(&item.ID, &item.Status, &item.Level, &item.Remark, &item.MarkTag, &item.Distribute); err != nil {
+			return nil, err
+		}
+		result[item.ID] = item
+	}
+	return result, rows.Err()
+}
+
+func (s *server) upsertWorkflowAction(id string, action string, value string) error {
+	allowed := map[string]bool{"feedback": true, "remark": true, "mark": true}
+	if !allowed[action] {
+		return errors.New("unsupported action")
+	}
+
+	if action == "feedback" {
+		content := strings.TrimSpace(value)
+		if content == "" {
+			return errors.New("feedback content required")
+		}
+
+		tx, err := s.bizDB().Begin()
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				_ = tx.Rollback()
+			}
+		}()
+
+		if _, err = tx.Exec(`INSERT INTO `+s.bizTable("nb_tab_grjd_workflow_state")+` (id, status) VALUES (?, '待核查') ON DUPLICATE KEY UPDATE id=id`, id); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`INSERT INTO `+s.bizTable("nb_tab_grjd_feedback_history")+` (clue_id, feedback_content, feedback_userId, feedback_username, remark, feedback_time) VALUES (?, ?, ?, ?, ?, NOW())`, id, content, "system", "系统", ""); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`UPDATE `+s.bizTable("nb_tab_grjd_workflow_state")+` SET status='已反馈', updated_at=NOW() WHERE id=?`, id); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if _, err := s.bizDB().Exec(`INSERT INTO `+s.bizTable("nb_tab_grjd_workflow_state")+` (id, status) VALUES (?, '待核查') ON DUPLICATE KEY UPDATE id=id`, id); err != nil {
+		return err
+	}
+
+	var query string
+	switch action {
+	case "remark":
+		query = `UPDATE ` + s.bizTable("nb_tab_grjd_workflow_state") + ` SET remark=? WHERE id=?`
+	case "mark":
+		query = `UPDATE ` + s.bizTable("nb_tab_grjd_workflow_state") + ` SET mark_tag=? WHERE id=?`
+	}
+	_, err := s.bizDB().Exec(query, value, id)
+	return err
+}

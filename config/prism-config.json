@@ -1,0 +1,43 @@
+{
+  "backend": {
+    "server_addr": ":8081"
+  },
+  "frontend": {
+    "port": 5173,
+    "api_target": "http://127.0.0.1:8081"
+  },
+  "db_table_whitelist": {
+    "sdata": [
+      "nb_tab_grjd_message",
+      "nb_tab_grjd_summary"
+    ],
+    "wxzdb": [
+      "feedback",
+      "feedback2nb_tab_grjd_feedback_history",
+      "grjd_distribute",
+      "grjdmxjg_za",
+      "nb_tab_grjd_feedback_history",
+      "nb_tab_grjd_workflow_state"
+    ]
+  },
+  "mysql": {
+    "dsn": "root:rootroot@tcp(127.0.0.1:13306)/sdata?charset=utf8mb4&parseTime=True&loc=Local"
+  },
+  "external_mysql": {
+    "database": "wxzdb",
+    "dsn": "root:rootroot@tcp(127.0.0.1:13306)/wxzdb?charset=utf8mb4&parseTime=True&loc=Local"
+  },
+  "llm": {
+    "api_base": "https://api.deepseek.com/v1",
+    "model_name": "deepseek-chat",
+    "api_key": "sk-2b9bd247380c479d8712463ac1d0d4a0"
+  },
+  "dialogue": {
+    "system_prompt_template": "你是研判助手Agent。你只能使用快照中的字段(type,level,score,summary)及聚合指标输出结论，不得臆造。\n分析范围: {{scope}}\n指定日期: {{day}}\n分析快照(JSON): {{snapshot}}",
+    "quick_prompts": [
+      "请给出该对象未来24小时风险变化判断。",
+      "请输出核查员可执行的三步处置建议。",
+      "请生成150字研判摘要并标注引用依据。"
+    ]
+  }
+}

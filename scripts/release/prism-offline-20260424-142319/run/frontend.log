@@ -1,0 +1,2 @@
+﻿[frontend] static+proxy server listening on http://127.0.0.1:5173
+[frontend] proxy target: http://127.0.0.1:8081

@@ -1,0 +1,2 @@
+﻿2026/04/27 22:07:49 config loaded from: C:\program1\shiftpop0\Prism\prism-app\scripts\release\prism-offline-20260425-140858\.\config\prism-config.json
+2026/04/27 22:07:49 mysql init failed: dial tcp 127.0.0.1:3306: connectex: No connection could be made because the target machine actively refused it.
