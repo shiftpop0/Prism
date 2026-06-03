@@ -2,3 +2,5 @@
 .gocache/
 .tmp/
 config/
+scripts/exports/
+scripts/release/
