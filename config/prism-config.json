@@ -3,7 +3,7 @@
     "server_addr": ":8081"
   },
   "frontend": {
-    "port": 5173,
+    "port": 5174,
     "api_target": "http://127.0.0.1:8081"
   },
   "db_table_whitelist": {
@@ -21,11 +21,11 @@
     ]
   },
   "mysql": {
-    "dsn": "root:rootroot@tcp(127.0.0.1:13306)/sdata?charset=utf8mb4&parseTime=True&loc=Local"
+    "dsn": "root:@tcp(127.0.0.1:3306)/sdata?charset=utf8mb4&parseTime=True&loc=Local"
   },
   "external_mysql": {
     "database": "wxzdb",
-    "dsn": "root:rootroot@tcp(127.0.0.1:13306)/wxzdb?charset=utf8mb4&parseTime=True&loc=Local"
+    "dsn": "root:@tcp(127.0.0.1:3306)/wxzdb?charset=utf8mb4&parseTime=True&loc=Local"
   },
   "llm": {
     "api_base": "https://api.deepseek.com/v1",

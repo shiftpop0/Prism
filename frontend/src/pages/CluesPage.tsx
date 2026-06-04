@@ -26,6 +26,7 @@ import dayjs, { type Dayjs } from 'dayjs'
 import 'dayjs/locale/zh-cn'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  exportClues,
   fetchCaseMessages,
   fetchClueDetail,
   fetchClueFeedbacks,
@@ -379,6 +380,24 @@ function CluesPage() {
     }
   }
 
+  const handleExport = async () => {
+    if (!selectedRowKeys.length) return message.warning('请先选择线索')
+    try {
+      const blob = await exportClues(selectedRowKeys)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `线索导出_${dayjs().format('YYYY-MM-DD')}.csv`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      message.success(`导出成功，共 ${selectedRowKeys.length} 条`)
+    } catch {
+      message.error('导出失败')
+    }
+  }
+
   const selectAllFiltered = async () => {
     setLoading(true)
     try {
@@ -531,6 +550,13 @@ function CluesPage() {
               <Button onClick={() => void openFeedbackEditor(selectedRowKeys)}>批量反馈</Button>
               <Button onClick={() => openInput('remark', selectedRowKeys)}>批量备注</Button>
               <Button onClick={() => openInput('mark', selectedRowKeys)}>批量标记</Button>
+              <Button
+                onClick={() => void handleExport()}
+                disabled={!selectedRowKeys.length}
+                style={{ backgroundColor: '#C3DFBA', borderColor: '#C3DFBA' }}
+              >
+                批量导出
+              </Button>
             </Space>
           </div>
         </Card>

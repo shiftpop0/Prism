@@ -829,6 +829,8 @@ func (s *server) cluesSubRoutes(w http.ResponseWriter, r *http.Request) {
 		s.clueMessages(w, r)
 	case strings.HasSuffix(r.URL.Path, "/action") && r.Method == http.MethodPost:
 		s.clueAction(w, r)
+	case strings.HasSuffix(r.URL.Path, "/export") && r.Method == http.MethodPost:
+		s.clueExport(w, r)
 	default:
 		methodNotAllowed(w)
 	}
@@ -3369,4 +3371,409 @@ func (s *server) upsertWorkflowAction(id string, action string, value string, fe
 	return err
 }
 
+// ---------- clue export ----------
 
+func csvEscape(s string) string {
+	if s == "" {
+		return ""
+	}
+	if strings.ContainsAny(s, ",\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
+}
+
+func buildDetailText(item *summaryRow, st workflowState, fb feedbackHistoryRow) string {
+	lines := []string{
+		fmt.Sprintf("type: %s", item.Type),
+		fmt.Sprintf("level: %s", st.Level.String),
+		fmt.Sprintf("msisdn_1: %s", item.Msisdn1),
+		fmt.Sprintf("msisdn_2: %s", item.Msisdn2),
+		fmt.Sprintf("cnt: %d", item.Cnt),
+		fmt.Sprintf("cnt_dt: %d", item.CntDt),
+		fmt.Sprintf("message: %s", item.Message),
+		fmt.Sprintf("summary: %s", item.Summary),
+		fmt.Sprintf("region: %s", item.Region.String),
+		fmt.Sprintf("info: %s", item.Info.String),
+		fmt.Sprintf("assign_to: %s", item.AssignTo.String),
+		fmt.Sprintf("score: %.2f", item.Score),
+		fmt.Sprintf("qklx: %s", item.Qklx.String),
+		fmt.Sprintf("label2: %s", item.Label2.String),
+		fmt.Sprintf("user_id: %s", item.UserID.String),
+		fmt.Sprintf("user_name: %s", item.UserName.String),
+		fmt.Sprintf("status: %s", st.Status),
+		fmt.Sprintf("feedback: %s", fb.Feedback),
+		fmt.Sprintf("feedback_time: %s", fb.FeedbackTime),
+		fmt.Sprintf("feedback_username: %s", fb.FeedbackUserName.String),
+		fmt.Sprintf("remark: %s", st.Remark.String),
+		fmt.Sprintf("mark_tag: %s", st.MarkTag.String),
+		fmt.Sprintf("distribute: %s", st.Distribute.String),
+		fmt.Sprintf("update_time: %s", item.UpdateTime),
+		fmt.Sprintf("data_date: %s", item.DataDate),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func buildFeedbackText(feedbacks []feedbackHistoryRow) string {
+	if len(feedbacks) == 0 {
+		return ""
+	}
+	chunks := make([]string, 0, len(feedbacks))
+	for i, f := range feedbacks {
+		chunk := fmt.Sprintf("[%d] time=%s\n    user=%s\n    content=%s",
+			i+1, f.FeedbackTime, f.FeedbackUserName.String, f.Feedback)
+		chunks = append(chunks, chunk)
+	}
+	return strings.Join(chunks, "\n----------------\n")
+}
+
+func buildMessagesText(messages []messageRow) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	chunks := make([]string, 0, len(messages))
+	for i, m := range messages {
+		chunk := fmt.Sprintf("[%d] time=%s\n    sender=%s\n    message=%s",
+			i+1, m.CaptureTime, m.Msisdn, m.Message)
+		chunks = append(chunks, chunk)
+	}
+	return strings.Join(chunks, "\n----------------\n")
+}
+
+func (s *server) loadSummaryMapByIDs(idForms []string) (map[string]*summaryRow, error) {
+	result := map[string]*summaryRow{}
+	if len(idForms) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(idForms))
+	args := make([]interface{}, len(idForms))
+	for i, id := range idForms {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+SELECT id,
+       COALESCE(type, '') AS type,
+       COALESCE(msisdn_1, '') AS msisdn_1,
+       COALESCE(msisdn_2, '') AS msisdn_2,
+       cnt, cnt_dt,
+       COALESCE(message, '') AS message,
+       COALESCE(summary, '') AS summary,
+       region, info, score,
+       qklx, label2, user_id, user_name, status,
+       COALESCE(DATE_FORMAT(update_time, '%%Y-%%m-%%d %%H:%%i:%%s'), '') AS update_time,
+       COALESCE(
+         DATE_FORMAT(dt, '%%Y-%%m-%%d'),
+         CASE
+           WHEN CHAR_LENGTH(TRIM(CAST(dt AS CHAR))) = 8
+           THEN CONCAT(
+             SUBSTRING(TRIM(CAST(dt AS CHAR)), 1, 4), '-',
+             SUBSTRING(TRIM(CAST(dt AS CHAR)), 5, 2), '-',
+             SUBSTRING(TRIM(CAST(dt AS CHAR)), 7, 2)
+           )
+           WHEN CHAR_LENGTH(TRIM(CAST(dt AS CHAR))) >= 10
+           THEN SUBSTRING(TRIM(CAST(dt AS CHAR)), 1, 10)
+           ELSE ''
+         END,
+         ''
+       ) AS data_date
+  FROM nb_tab_grjd_summary
+ WHERE id IN (%s)
+ ORDER BY update_time DESC`, strings.Join(placeholders, ","))
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		item := &summaryRow{}
+		if err := rows.Scan(
+			&item.ID, &item.Type, &item.Msisdn1, &item.Msisdn2, &item.Cnt, &item.CntDt,
+			&item.Message, &item.Summary, &item.Region, &item.Info, &item.Score, &item.Qklx, &item.Label2, &item.UserID, &item.UserName,
+			&item.Status, &item.UpdateTime, &item.DataDate,
+		); err != nil {
+			return nil, err
+		}
+		item.Msisdn1, item.Msisdn2 = canonicalPair(item.Msisdn1, item.Msisdn2)
+		item.Type = strings.TrimSpace(item.Type)
+		if item.Type == "" {
+			item.Type = "未分类"
+		}
+		item.ID = canonicalID(item.ID)
+		canonical := item.ID
+
+		prev, exists := result[canonical]
+		if !exists || item.UpdateTime > prev.UpdateTime {
+			result[canonical] = item
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	ids := make([]string, 0, len(result))
+	for id := range result {
+		ids = append(ids, id)
+	}
+	assignToMap, err := s.loadAssignToMapByIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, item := range result {
+		item.AssignTo = assignToMap[id]
+	}
+
+	return result, nil
+}
+
+func (s *server) loadFeedbackHistoryAllMapByIDs(idForms []string) (map[string][]feedbackHistoryRow, error) {
+	result := map[string][]feedbackHistoryRow{}
+	if len(idForms) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(idForms))
+	args := make([]interface{}, len(idForms))
+	for i, id := range idForms {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+SELECT clue_id, feedback_content, DATE_FORMAT(feedback_time, '%%Y-%%m-%%d %%H:%%i:%%s'), feedback_userId, feedback_username, remark
+FROM %s
+WHERE clue_id IN (%s)
+ORDER BY feedback_time ASC`, s.bizTable("nb_tab_grjd_feedback_history"), strings.Join(placeholders, ","))
+
+	rows, err := s.bizDB().Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item feedbackHistoryRow
+		if err := rows.Scan(&item.ID, &item.Feedback, &item.FeedbackTime, &item.FeedbackUserID, &item.FeedbackUserName, &item.Remark); err != nil {
+			return nil, err
+		}
+		canonical := canonicalID(item.ID)
+		item.ID = canonical
+		result[canonical] = append(result[canonical], item)
+	}
+
+	return result, rows.Err()
+}
+
+func (s *server) loadMessagesMapByIDs(idForms []string) (map[string][]messageRow, error) {
+	result := map[string][]messageRow{}
+	if len(idForms) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(idForms))
+	args := make([]interface{}, len(idForms))
+	for i, id := range idForms {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+SELECT id, capture_time, msisdn, calltype, message
+FROM nb_tab_grjd_message
+WHERE id IN (%s)
+ORDER BY capture_time ASC`, strings.Join(placeholders, ","))
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type keyMsg struct {
+		canonical string
+		msg       string
+	}
+	byMessage := map[keyMsg]messageRow{}
+	for rows.Next() {
+		var item messageRow
+		if err := rows.Scan(&item.ID, &item.CaptureTime, &item.Msisdn, &item.CallType, &item.Message); err != nil {
+			return nil, err
+		}
+		canonical := canonicalID(item.ID)
+		key := keyMsg{canonical: canonical, msg: item.Message}
+
+		prev, exists := byMessage[key]
+		if !exists {
+			byMessage[key] = item
+			continue
+		}
+		if prev.CallType == "2" && item.CallType == "1" {
+			byMessage[key] = item
+			continue
+		}
+		if prev.CallType == item.CallType && item.CaptureTime < prev.CaptureTime {
+			byMessage[key] = item
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for key, item := range byMessage {
+		result[key.canonical] = append(result[key.canonical], item)
+	}
+	for canonical := range result {
+		slices.SortFunc(result[canonical], func(a, b messageRow) int {
+			return cmp.Compare(a.CaptureTime, b.CaptureTime)
+		})
+	}
+
+	return result, nil
+}
+
+func (s *server) clueExport(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		badRequest(w, "invalid body")
+		return
+	}
+	if len(req.IDs) == 0 {
+		badRequest(w, "ids required")
+		return
+	}
+
+	orderedCanonical := make([]string, 0, len(req.IDs))
+	seenCanonical := make(map[string]bool)
+	allIDFormsSet := make(map[string]bool)
+
+	for _, rawID := range req.IDs {
+		canonical := canonicalID(strings.TrimSpace(rawID))
+		if canonical == "" || seenCanonical[canonical] {
+			continue
+		}
+		seenCanonical[canonical] = true
+		orderedCanonical = append(orderedCanonical, canonical)
+		allIDFormsSet[canonical] = true
+		allIDFormsSet[reverseID(canonical)] = true
+	}
+
+	if len(orderedCanonical) == 0 {
+		badRequest(w, "no valid ids")
+		return
+	}
+
+	allIDForms := make([]string, 0, len(allIDFormsSet))
+	for id := range allIDFormsSet {
+		allIDForms = append(allIDForms, id)
+	}
+
+	summaryMap, err := s.loadSummaryMapByIDs(allIDForms)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	if err := s.ensureWorkflowRows(orderedCanonical); err != nil {
+		internalError(w, err)
+		return
+	}
+	workflowMap, err := s.loadWorkflowMapByIDs(orderedCanonical)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	latestFeedbackMap, err := s.loadLatestFeedbackMap(orderedCanonical)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	distributeMap, err := s.loadDistributeMapByIDs(orderedCanonical)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	feedbackMap, err := s.loadFeedbackHistoryAllMapByIDs(allIDForms)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	messageMap, err := s.loadMessagesMapByIDs(allIDForms)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("\xEF\xBB\xBF")
+
+	headers := []string{
+		"线索ID", "类型", "线索等级", "号码1", "号码2", "分数", "状态", "分配",
+		"分配负责人", "标记", "前科类型", "属地", "短信全文", "AI总结", "备注",
+		"额外信息", "数据日期", "更新时间", "最新反馈", "最新反馈时间", "最新反馈人",
+		"详情压缩", "历史反馈压缩", "上下文短信压缩",
+	}
+	buf.WriteString(strings.Join(headers, ",") + "\n")
+
+	for _, canonical := range orderedCanonical {
+		item := summaryMap[canonical]
+		if item == nil {
+			continue
+		}
+		st := workflowMap[canonical]
+		fb := latestFeedbackMap[canonical]
+		d := distributeMap[canonical]
+
+		level := st.Level.String
+		if strings.TrimSpace(level) == "" {
+			level = strings.TrimSpace(d.Level.String)
+		}
+		distribute := st.Distribute.String
+		if strings.TrimSpace(distribute) == "" {
+			distribute = strings.TrimSpace(d.Tag.String)
+		}
+
+		row := []string{
+			csvEscape(canonical),
+			csvEscape(item.Type),
+			csvEscape(level),
+			csvEscape(item.Msisdn1),
+			csvEscape(item.Msisdn2),
+			csvEscape(fmt.Sprintf("%.2f", item.Score)),
+			csvEscape(resolveStatus(st.Status, fb.Feedback != "")),
+			csvEscape(distribute),
+			csvEscape(item.AssignTo.String),
+			csvEscape(st.MarkTag.String),
+			csvEscape(item.Qklx.String),
+			csvEscape(item.Region.String),
+			csvEscape(item.Message),
+			csvEscape(item.Summary),
+			csvEscape(st.Remark.String),
+			csvEscape(item.Info.String),
+			csvEscape(item.DataDate),
+			csvEscape(item.UpdateTime),
+			csvEscape(fb.Feedback),
+			csvEscape(fb.FeedbackTime),
+			csvEscape(fb.FeedbackUserName.String),
+			csvEscape(buildDetailText(item, st, fb)),
+			csvEscape(buildFeedbackText(feedbackMap[canonical])),
+			csvEscape(buildMessagesText(messageMap[canonical])),
+		}
+		buf.WriteString(strings.Join(row, ",") + "\n")
+	}
+
+	filename := fmt.Sprintf("线索导出_%s.csv", time.Now().Format("2006-01-02"))
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}

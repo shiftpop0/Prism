@@ -1,7 +1,7 @@
 param(
   [string]$ConfigPath = ".\config\prism-config.json",
   [int]$BackendPort = 8081,
-  [int]$FrontendPort = 5173,
+  [int]$FrontendPort = 5174,
   [string]$MysqlHost = "127.0.0.1",
   [int]$MysqlPort = 3306,
   [string]$MysqlDSN = "",

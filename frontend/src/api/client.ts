@@ -297,6 +297,14 @@ export async function fetchClueFeedbacks(id: string): Promise<FeedbackHistoryIte
   return data.data
 }
 
+export async function exportClues(ids: string[]): Promise<Blob> {
+  const { data } = await api.post<Blob>('/clues/export', { ids }, {
+    responseType: 'blob',
+    timeout: 300000,
+  })
+  return data
+}
+
 export async function updateClueAction(id: string, action: 'feedback' | 'remark' | 'mark', value: string, feedbackUser?: string) {
   const { data } = await api.post<ApiResponse<{ id: string }>>(`/clues/${encodeURIComponent(id)}/action`, {
     action,
