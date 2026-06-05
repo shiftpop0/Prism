@@ -21,11 +21,11 @@
     ]
   },
   "mysql": {
-    "dsn": "root:@tcp(127.0.0.1:3306)/sdata?charset=utf8mb4&parseTime=True&loc=Local"
+    "dsn": "root:rootroot@tcp(127.0.0.1:13307)/sdata?charset=utf8mb4&parseTime=True&loc=Local"
   },
   "external_mysql": {
     "database": "wxzdb",
-    "dsn": "root:@tcp(127.0.0.1:3306)/wxzdb?charset=utf8mb4&parseTime=True&loc=Local"
+    "dsn": "root:rootroot@tcp(127.0.0.1:13306)/wxzdb?charset=utf8mb4&parseTime=True&loc=Local"
   },
   "llm": {
     "api_base": "https://api.deepseek.com/v1",

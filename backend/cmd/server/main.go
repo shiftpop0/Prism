@@ -3070,6 +3070,13 @@ SELECT s.id,
 			} else if a.Score > b.Score {
 				cmp = 1
 			}
+		case "update_time":
+			// Sort by data_date (displayed as "数据日期"), fallback to update_time for deterministic order.
+			va, vb = a.DataDate, b.DataDate
+			cmp = strings.Compare(va, vb)
+			if cmp == 0 {
+				cmp = strings.Compare(a.UpdateTime, b.UpdateTime)
+			}
 		case "status":
 			sa := strings.TrimSpace(wa.Status)
 			sb := strings.TrimSpace(wb.Status)
@@ -3090,7 +3097,7 @@ SELECT s.id,
 			va, vb = a.AssignTo.String, b.AssignTo.String
 			cmp = strings.Compare(va, vb)
 		default:
-			// Sort by data_date shown in list. Fallback to update_time then id for deterministic order.
+			// Unknown sort field — fall back to data_date, then update_time.
 			va, vb = a.DataDate, b.DataDate
 			cmp = strings.Compare(va, vb)
 			if cmp == 0 {

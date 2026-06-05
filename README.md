@@ -79,3 +79,7 @@ If `npm` is not found in current shell, open a new terminal session and retry.
 - `{{snapshot}}`：后端生成的受限快照 JSON
 
 修改配置后重启后端即可生效。
+
+## 6. 更新记录
+
+- **2026-06-05** 新增线索筛选导出功能；数据库迁移至本地独立实例（sdata → MySQL 5.7 :13307, wxzdb → MySQL 8.0 :13306）；修复线索池排序滞后问题（stale closure）；后端补充 `update_time` 排序显式分支；`.mysql/` 加入 `.gitignore`。

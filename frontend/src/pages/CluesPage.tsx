@@ -194,15 +194,17 @@ function CluesPage() {
     [markOptions],
   )
 
-  const loadRows = async (p = currentPage, ps = pageSize) => {
+  const loadRows = async (p = currentPage, ps = pageSize, sb?: ClueSortBy, so?: ClueSortOrder) => {
+    const effectiveSortBy = sb ?? sortBy
+    const effectiveSortOrder = so ?? sortOrder
     setLoading(true)
     try {
       const data = await fetchSummaryCases({
         keyword: keyword.trim() || undefined,
         page: p,
         pageSize: ps,
-        sortBy,
-        sortOrder,
+        sortBy: effectiveSortBy,
+        sortOrder: effectiveSortOrder,
         status: statusFilter,
         markTag: markFilter,
         distribute: distributeFilter,
@@ -501,9 +503,11 @@ function CluesPage() {
 
   const onTableChange: TableProps<SummaryCase>['onChange'] = (pagination, _filters, sorter) => {
     const s = Array.isArray(sorter) ? sorter[0] : sorter
-    setSortBy((s?.columnKey as ClueSortBy) || 'update_time')
-    setSortOrder(s?.order === 'ascend' ? 'asc' : 'desc')
-    void loadRows(pagination.current || 1, pagination.pageSize || pageSize)
+    const newSortBy = (s?.columnKey as ClueSortBy) || 'update_time'
+    const newSortOrder = s?.order === 'ascend' ? 'asc' : 'desc'
+    setSortBy(newSortBy)
+    setSortOrder(newSortOrder)
+    void loadRows(pagination.current || 1, pagination.pageSize || pageSize, newSortBy, newSortOrder)
   }
 
   return (

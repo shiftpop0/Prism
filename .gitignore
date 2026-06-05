@@ -1,6 +1,7 @@
 .cache/
 .gocache/
 .tmp/
+.mysql/
 config/
 scripts/exports/
 scripts/release/
