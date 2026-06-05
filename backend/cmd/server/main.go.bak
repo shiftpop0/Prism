@@ -2253,7 +2253,7 @@ func (s *server) downloadFeedbackTemplate(w http.ResponseWriter, r *http.Request
 	defer f.Close()
 
 	sheet := f.GetSheetName(0)
-	headers := []string{"线索ID(可为空)", "号码1(若有ID则可为空)", "号码2(若有ID则可为空)", "推送时间(可为空)", "反馈内容(必填)", "反馈人ID(可为空)", "反馈人(必填)", "反馈时间(可为空)", "备注(可为空)"}
+	headers := []string{"线索ID", "号码1", "号码2", "推送时间", "反馈内容", "反馈人ID", "反馈人", "反馈时间", "备注"}
 	for i, h := range headers {
 		col, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheet, col, h)
@@ -2264,40 +2264,20 @@ func (s *server) downloadFeedbackTemplate(w http.ResponseWriter, r *http.Request
 	})
 	f.SetRowStyle(sheet, 1, 1, headerStyle)
 
-	// Row 2: demo with nullable fields left empty — visually marks which fields are optional.
-	row2 := []string{"", "", "", "", "经核查，该号码涉及XX诈骗", "", "张三", "", "需进一步跟进"}
-	for i, v := range row2 {
+	example := []string{"13812345678-13987654321-20240615", "13812345678", "13987654321", "2024-06-15", "经核查，该号码涉及XX诈骗", "user001", "张三", "2024-06-16 10:30:00", "需进一步跟进"}
+	for i, v := range example {
 		col, _ := excelize.CoordinatesToCellName(i+1, 2)
 		f.SetCellValue(sheet, col, v)
 	}
 
-	// Rows 3-7: PushTime format demos — fill required fields, vary PushTime.
-	base := []string{"", "13812345678", "13987654321", "", "推送时间格式演示", "", "张三", "", ""}
-	formats := []string{
-		"20240615",               // compact
-		"2024-06-15",             // dash date
-		"2024/06/15",             // slash date
-		"2024-06-15 10:30:00",    // dash datetime
-		"2024/06/15 10:30:00",    // slash datetime
-	}
-	for r, fmt := range formats {
-		row := make([]string, len(base))
-		copy(row, base)
-		row[3] = fmt
-		for i, v := range row {
-			col, _ := excelize.CoordinatesToCellName(i+1, r+3)
-			f.SetCellValue(sheet, col, v)
-		}
-	}
-
 	f.SetColWidth(sheet, "A", "A", 32)
-	f.SetColWidth(sheet, "B", "B", 18)
-	f.SetColWidth(sheet, "C", "C", 18)
-	f.SetColWidth(sheet, "D", "D", 24)
+	f.SetColWidth(sheet, "B", "B", 16)
+	f.SetColWidth(sheet, "C", "C", 16)
+	f.SetColWidth(sheet, "D", "D", 14)
 	f.SetColWidth(sheet, "E", "E", 36)
-	f.SetColWidth(sheet, "F", "F", 16)
+	f.SetColWidth(sheet, "F", "F", 14)
 	f.SetColWidth(sheet, "G", "G", 14)
-	f.SetColWidth(sheet, "H", "H", 24)
+	f.SetColWidth(sheet, "H", "H", 22)
 	f.SetColWidth(sheet, "I", "I", 22)
 
 	var buf bytes.Buffer

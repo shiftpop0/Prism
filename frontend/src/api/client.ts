@@ -401,3 +401,42 @@ export async function initWorkflowState(): Promise<InitWorkflowStateResult> {
   const { data } = await api.post<ApiResponse<InitWorkflowStateResult>>('/db/init-workflow-state')
   return data.data
 }
+
+export interface SyncRunResult {
+  synced: boolean
+}
+
+export async function triggerSync(): Promise<SyncRunResult> {
+  const { data } = await api.post<ApiResponse<SyncRunResult>>('/sync/run')
+  return data.data
+}
+
+export interface ExcelFeedbackFailure {
+  row: number
+  clue_id: string
+  reason: string
+}
+
+export interface ImportFeedbackExcelResult {
+  total: number
+  imported: number
+  failed: number
+  failed_details: ExcelFeedbackFailure[]
+}
+
+export async function importFeedbackExcel(file: File): Promise<ImportFeedbackExcelResult> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const { data } = await api.post<ApiResponse<ImportFeedbackExcelResult>>('/db/import-feedback-excel', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300000,
+  })
+  return data.data
+}
+
+export async function downloadFeedbackTemplate(): Promise<Blob> {
+  const { data } = await api.get<Blob>('/db/feedback-template', {
+    responseType: 'blob',
+  })
+  return data
+}

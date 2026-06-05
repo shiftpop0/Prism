@@ -2,7 +2,7 @@ import { Card, Col, Progress, Row, Space, Statistic, Typography } from 'antd'
 import { CheckCircleTwoTone, LoadingOutlined } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
 import { useEffect, useMemo, useState } from 'react'
-import { fetchOverview, fetchTrend, type DashboardOverview, type TrendPoint } from '../api/client'
+import { fetchOverview, fetchTrend, triggerSync, type DashboardOverview, type TrendPoint } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -30,6 +30,7 @@ function DashboardPage() {
   const [trendLoadSucceeded, setTrendLoadSucceeded] = useState(false)
 
   useEffect(() => {
+    triggerSync().catch(() => {})
     setOverviewLoading(true)
     setOverviewLoadSucceeded(false)
     fetchOverview()

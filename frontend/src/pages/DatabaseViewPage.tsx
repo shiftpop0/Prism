@@ -1,6 +1,7 @@
 ﻿import { Button, Card, Input, Modal, Select, Space, Table, Typography, message } from 'antd'
+import { DownloadOutlined } from '@ant-design/icons'
 import { type MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from 'react'
-import { fetchDatabaseTableRows, fetchDatabaseTables, importDistributeToWorkflow, importFeedbackToHistory, resolveApiErrorDetails, type DatabaseTableRows } from '../api/client'
+import { downloadFeedbackTemplate, fetchDatabaseTableRows, fetchDatabaseTables, importDistributeToWorkflow, importFeedbackExcel, importFeedbackToHistory, resolveApiErrorDetails, type DatabaseTableRows } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -81,6 +82,10 @@ function DatabaseViewPage() {
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({})
   const [resizingCol, setResizingCol] = useState<string | null>(null)
   const resizeRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null)
+
+  const [excelModalOpen, setExcelModalOpen] = useState(false)
+  const [excelImporting, setExcelImporting] = useState(false)
+  const [excelFile, setExcelFile] = useState<File | null>(null)
 
   const columnWidthStorageKey = useMemo(
     () => `prism:db-table-column-widths:${databaseKey}:${selectedTable || '__none__'}`,
@@ -280,6 +285,48 @@ function DatabaseViewPage() {
     }
   }
 
+  const handleDownloadTemplate = async () => {
+    try {
+      const blob = await downloadFeedbackTemplate()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'feedback_import_template.xlsx'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch {
+      message.error('下载模板失败')
+    }
+  }
+
+  const handleExcelImport = async () => {
+    if (!excelFile) {
+      message.warning('请先选择文件')
+      return
+    }
+    setExcelImporting(true)
+    try {
+      const result = await importFeedbackExcel(excelFile)
+      const failures = result.failed_details || []
+      const failureLines = failures.length
+        ? '\n\n失败详情（最多显示100条）:\n' + failures.map((f) => `第${f.row}行 (${f.clue_id}): ${f.reason}`).join('\n')
+        : ''
+      Modal.success({
+        title: '导入完成',
+        content: `共处理 ${result.total} 行。成功导入 ${result.imported} 条，失败 ${result.failed} 条。${failureLines}`,
+        width: 720,
+      })
+      setExcelModalOpen(false)
+      setExcelFile(null)
+    } catch (error) {
+      message.error(resolveApiErrorMessage(error, '导入失败'))
+    } finally {
+      setExcelImporting(false)
+    }
+  }
+
   const columns = useMemo(() => {
     if (!data) return []
     const startResizeColumn = (event: ReactMouseEvent<HTMLElement>, key: string, width: number) => {
@@ -393,6 +440,7 @@ function DatabaseViewPage() {
           <Button className="db-import-btn" onClick={handleImportFeedback} loading={importing}>一键导入反馈</Button>
           <Button className="db-import-btn" onClick={handleImportDistribute} loading={importing}>一键导入线索分配和等级</Button>
           <Button onClick={handleClearClientCache}>清空缓存</Button>
+          <Button className="db-import-btn" onClick={() => setExcelModalOpen(true)}>手动导入反馈</Button>
         </Space>
         <div style={{ marginTop: 10 }}>
           <Text type="secondary">当前库共 {tables.length} 个数据表，使用分页浏览表数据。</Text>
@@ -420,6 +468,34 @@ function DatabaseViewPage() {
           locale={{ emptyText: selectedTable ? '暂无数据' : '请选择数据表后查看' }}
         />
       </Card>
+
+      <Modal
+        title="手动导入反馈数据"
+        open={excelModalOpen}
+        onCancel={() => { setExcelModalOpen(false); setExcelFile(null) }}
+        onOk={handleExcelImport}
+        okText="开始导入"
+        confirmLoading={excelImporting}
+        okButtonProps={{ disabled: !excelFile }}
+        width={560}
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <Text>请下载模板，按格式填写反馈数据后上传 Excel 文件。</Text>
+          <Button icon={<DownloadOutlined />} onClick={handleDownloadTemplate}>下载 Excel 模板</Button>
+          <input
+            type="file"
+            accept=".xlsx,.xls"
+            onChange={(e) => {
+              const f = e.target.files?.[0] || null
+              setExcelFile(f)
+            }}
+          />
+          {excelFile && <Text type="secondary">已选择：{excelFile.name} ({(excelFile.size / 1024).toFixed(1)} KB)</Text>}
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            模板列说明：线索ID（优先匹配）、号码1、号码2、推送时间（用于构造线索ID）、反馈内容（必填）、反馈人ID、反馈人、反馈时间、备注
+          </Text>
+        </Space>
+      </Modal>
 
       <Modal
         title={previewTitle}

@@ -1,4 +1,4 @@
-module prism/backend
+module prism/scripts/liukou
 
 go 1.25.6
 
@@ -19,6 +19,4 @@ require (
 	golang.org/x/text v0.34.0 // indirect
 )
 
-replace github.com/go-sql-driver/mysql => ./third_party/mysql
-
-replace filippo.io/edwards25519 => ./third_party/edwards25519
+replace github.com/go-sql-driver/mysql => ../../backend/third_party/mysql
